@@ -64,12 +64,16 @@ end
 Invoke `lld -flavor wasm` to turn a wasm object file into a final wasm
 module. Module imports/exports / memory layout are configured here.
 """
-function link_wasm(obj_path::String, wasm_path::String; entry_name::String)
+function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
+                   initial_memory::Integer = 16 * 1024 * 1024,   # 16 MB
+                   max_memory::Integer     = 256 * 1024 * 1024)  # 256 MB
     LLD_jll.lld() do lld
         run(`$lld -flavor wasm
              --no-entry
              --export=$entry_name
              --allow-undefined
+             --initial-memory=$initial_memory
+             --max-memory=$max_memory
              -o $wasm_path
              $obj_path`)
     end

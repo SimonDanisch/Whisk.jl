@@ -47,7 +47,11 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
     // (allocator imports are only invoked during *runtime* calls, not at
     // instantiation, so the late binding is fine).
     let mem = null;
-    let heapNext = 65536;
+    // Heap starts well past wasm-ld's `__stack_pointer` (~64-128 KB) so
+    // bump allocations don't trample the stack. 1 MiB is overkill but
+    // gives plenty of headroom; we'll pull the actual `__heap_base`
+    // symbol at link time once we wire it up.
+    let heapNext = 1024 * 1024;
     const view = () => new DataView(mem.buffer);
     const alloc_bytes = (n) => { const off = heapNext; heapNext += (n + 7) & ~7; return off; };
     const imports = {
@@ -69,6 +73,19 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
         gpu_report_exception(_p) { throw new Error("gpu_report_exception"); },
         gpu_report_oom(_sz) { throw new Error("gpu_report_oom"); },
         gpu_signal_exception() { throw new Error("gpu_signal_exception"); },
+        // C library — Dict's `fill!`, Vector resize, copy, etc.
+        memset(p, val, n) {
+          new Uint8Array(mem.buffer).fill(val & 0xff, p, p + n);
+          return p;
+        },
+        memcpy(dst, src, n) {
+          new Uint8Array(mem.buffer).copyWithin(dst, src, src + n);
+          return dst;
+        },
+        memmove(dst, src, n) {
+          new Uint8Array(mem.buffer).copyWithin(dst, src, src + n);
+          return dst;
+        },
       },
     };
 
