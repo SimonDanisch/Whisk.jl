@@ -20,16 +20,17 @@ hand-rolled relooper, no Binaryen API holes.
 
 ## Status
 
-Pre-M1. Scaffolding only.
+M1, M2, and the bump-allocator half of M3 are done. 33 / 34 tests
+green — only String runtime indexing remains broken until M4.
 
 ## Roadmap
 
 | | Milestone | What works | Notes |
 |---|---|---|---|
-| M1 | `f(x::Int32)::Int32 = x + 1` runs in V8 | end-to-end pipeline | no allocator yet |
-| M2 | `Vector{Float32}(undef, n)` | bump allocator | linear-memory runtime |
-| M3 | mark-sweep GC | allocations across calls retained | full GC integration |
-| M4 | `Dict`, `Set`, `BitVector` | normal stdlib, no overrides | mostly free if M3 holds |
+| ✓ M1 | `f(x::Int32)::Int32 = x + 1` runs in V8 | end-to-end pipeline | done |
+| ✓ M2 | `Vector{T}(undef, n)`, indexing | linear-memory allocation | done |
+| ◐ M3 | bump allocator emitted in-wasm | done | mark-sweep collector is future work |
+| M4 | `Dict`, `Set`, `BitVector` | normal stdlib, no overrides | needs M3 collector |
 | M5 | `@jsexport`, JS marshal | end-to-end JS↔wasm round trip | typed-array based |
 | M6 | A* with `BinaryMinHeap` | parity vs WAC | regression check |
 | M7 | ccall validator | friendly errors for unsupported ccalls | only invalid Julia surface |
