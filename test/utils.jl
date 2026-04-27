@@ -46,6 +46,11 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
     // host-side malloc. JS only provides error stubs and the C-library
     // bulk-memory functions that LLVM may emit references to.
     let mem = null;
+    // wasm64 passes 64-bit integer args/results as JS BigInts.
+    // Convert at the boundary: BigInt → Number for typed-array
+    // offsets / lengths (heap fits in 53 bits, no precision loss),
+    // and Number → BigInt for return values.
+    const N = (b) => typeof b === 'bigint' ? Number(b) : b;
     const imports = {
       env: {
         jl_argument_error(_p) { throw new Error("argument error"); },
@@ -53,15 +58,18 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
         gpu_report_oom(_sz) { throw new Error("gpu_report_oom"); },
         gpu_signal_exception() { throw new Error("gpu_signal_exception"); },
         memset(p, val, n) {
-          new Uint8Array(mem.buffer).fill(val & 0xff, p, p + n);
+          const pn = N(p), nn = N(n);
+          new Uint8Array(mem.buffer).fill(Number(val) & 0xff, pn, pn + nn);
           return p;
         },
         memcpy(dst, src, n) {
-          new Uint8Array(mem.buffer).copyWithin(dst, src, src + n);
+          const dn = N(dst), sn = N(src), nn = N(n);
+          new Uint8Array(mem.buffer).copyWithin(dn, sn, sn + nn);
           return dst;
         },
         memmove(dst, src, n) {
-          new Uint8Array(mem.buffer).copyWithin(dst, src, src + n);
+          const dn = N(dst), sn = N(src), nn = N(n);
+          new Uint8Array(mem.buffer).copyWithin(dn, sn, sn + nn);
           return dst;
         },
       },

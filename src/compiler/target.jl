@@ -13,7 +13,7 @@ Base.@kwdef struct WasmCompilerTarget <: AbstractCompilerTarget
     features::String = ""
 end
 
-GPUCompiler.llvm_triple(::WasmCompilerTarget) = "wasm32-unknown-unknown"
+GPUCompiler.llvm_triple(::WasmCompilerTarget) = "wasm64-unknown-unknown"
 
 function GPUCompiler.llvm_machine(target::WasmCompilerTarget)
     triple = GPUCompiler.llvm_triple(target)
@@ -53,18 +53,30 @@ GPUCompiler.kernel_state_type(::WasmCompilerJob) = Nothing
 # Cache slug for the disk-cached compiled-runtime image. Combines target
 # triple + features so jobs differing in those don't share a cache.
 GPUCompiler.runtime_slug(job::WasmCompilerJob) =
-    "wasm32-$(job.config.target.features)"
+    "wasm64-$(job.config.target.features)"
 
 # `finish_module!` runs AFTER IR generation but BEFORE optimize!, so
 # we can rewrite `julia.gc_alloc_obj` calls here — pre-empting
 # GPUCompiler's `lower_gc_frame!` pass which would otherwise call into
 # a host-typed `gc_pool_alloc(i64)`. wasm32 needs an i32 size.
 function GPUCompiler.finish_module!(job::WasmCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
-    emit_wasm_runtime!(mod)                    # in-wasm allocator, Memory ctor, GC
-    lower_gc_alloc_wasm32!(mod)                # julia.gc_alloc_obj → whisk_gc_alloc
+    # Pre-optimize passes. Sub-jobs (GPUCompiler runtime helpers) flow
+    # through its standard pipeline.
+    job.config.toplevel || return entry
+
+    emit_wasm_runtime!(mod)                    # allocator, Memory ctor, GC
+    lower_gc_alloc_wasm!(mod)                  # julia.gc_alloc_obj → whisk_gc_alloc
     lower_gc_frame_intrinsics!(mod)            # 1.11+ GC frames → shadow stack
-    bypass_argument_error_checks!(mod)         # mistruncated wasm32 bounds checks
-    rewrite_host_pointer_constants!(mod)       # baked-in host-VM Memory singletons → @_whisk_empty_memory
+    bypass_argument_error_checks!(mod)         # bypass mistruncated bounds checks
+    return entry
+end
+
+function GPUCompiler.finish_ir!(job::WasmCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
+    # Post-optimize: const-prop can leave host-VM pointer literals
+    # baked into the IR (`inttoptr (i64 N to ptr)` where N is a host
+    # process address). Sweep them after optimization runs.
+    job.config.toplevel || return entry
+    rewrite_host_pointer_constants!(mod)
     return entry
 end
 

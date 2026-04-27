@@ -69,6 +69,7 @@ function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
                    max_memory::Integer     = 256 * 1024 * 1024)  # 256 MB
     LLD_jll.lld() do lld
         run(`$lld -flavor wasm
+             -mwasm64
              --no-entry
              --export=$entry_name
              --export=whisk_gc_collect
