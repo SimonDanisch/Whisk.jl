@@ -71,6 +71,7 @@ function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
         run(`$lld -flavor wasm
              --no-entry
              --export=$entry_name
+             --export=whisk_gc_collect
              --allow-undefined
              --initial-memory=$initial_memory
              --max-memory=$max_memory

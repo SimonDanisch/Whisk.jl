@@ -20,8 +20,8 @@ hand-rolled relooper, no Binaryen API holes.
 
 ## Status
 
-M1, M2, and the bump-allocator half of M3 are done. 33 / 34 tests
-green — only String runtime indexing remains broken until M4.
+M1, M2, M3 complete. **39 / 40 tests** green — only String runtime
+indexing remains broken until M4.
 
 ## Roadmap
 
@@ -29,11 +29,43 @@ green — only String runtime indexing remains broken until M4.
 |---|---|---|---|
 | ✓ M1 | `f(x::Int32)::Int32 = x + 1` runs in V8 | end-to-end pipeline | done |
 | ✓ M2 | `Vector{T}(undef, n)`, indexing | linear-memory allocation | done |
-| ◐ M3 | bump allocator emitted in-wasm | done | mark-sweep collector is future work |
-| M4 | `Dict`, `Set`, `BitVector` | normal stdlib, no overrides | needs M3 collector |
+| ✓ M3 | mark-sweep GC, retains across calls | precise roots, conservative scan | done |
+| M4 | `Dict`, `Set`, `BitVector` | normal stdlib, no overrides | should mostly work given M3 |
 | M5 | `@jsexport`, JS marshal | end-to-end JS↔wasm round trip | typed-array based |
 | M6 | A* with `BinaryMinHeap` | parity vs WAC | regression check |
 | M7 | ccall validator | friendly errors for unsupported ccalls | only invalid Julia surface |
+
+## GC architecture
+
+```
+Linear-memory layout after wasm-ld:
+
+    0  ┌────────────────────────────────┐
+       │ rodata, data segments          │
+       ├────────────────────────────────┤
+       │ wasm stack (grows down)        │
+ __heap_base ───────────────────────────┤
+       │ allocated heap (header+payload)│
+       │   ↓ bump allocator             │
+ _whisk_heap_next ──────────────────────┤
+       │ free space                     │
+    ↓  └────────────────────────────────┘
+```
+
+Each allocation has an 8-byte header: 4-byte size + 4-byte flags
+(mark / free bits). The free list reuses freed chunks' payloads as
+"next free" pointers.
+
+Roots come from Julia's GC frame intrinsics (`julia.{new, push, pop}_
+gc_frame`, `julia.get_gc_frame_slot`, `julia.get_pgcstack`). We
+*lower* them — instead of nullifying, as a minimal implementation
+might — into real linked-list operations on `_whisk_pgcstack`. That
+gives us PRECISE roots (the Julia compiler tells us which locals are
+GC pointers); payload bodies are scanned conservatively (every
+aligned 4-byte word treated as a potential heap pointer).
+
+`whisk_gc_collect` is exported from every wasm module so callers can
+drive GC explicitly.
 
 ## ccall policy
 

@@ -76,6 +76,51 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
     return _parse_node_result(raw, rettype)
 end
 
+"""
+    inspect_gc(wasm_path) → NamedTuple
+
+Run a wasm module under JS that interleaves its main `call` with
+`whisk_gc_collect()` invocations, and reports `_whisk_heap_next` /
+`_whisk_free_list_head` along the way. Used for GC functional tests.
+
+The wasm must export `whisk_gc_collect` (Whisk does this at link time).
+"""
+function gc_probe(wasm_path::AbstractString, entry::AbstractString, args; rettype = nothing)
+    args_js = join(string.(args), ", ")
+    js = """
+    import fs from 'node:fs';
+    const bytes = fs.readFileSync(process.argv[1]);
+    let mem = null;
+    const imports = { env: {
+        jl_argument_error(_p) { throw new Error("argument error"); },
+        gpu_report_exception(_p) { throw new Error("gpu_report_exception"); },
+        gpu_report_oom(_sz) { throw new Error("gpu_report_oom"); },
+        gpu_signal_exception() { throw new Error("gpu_signal_exception"); },
+        memset(p, val, n) {
+          new Uint8Array(mem.buffer).fill(val & 0xff, p, p + n); return p;
+        },
+        memcpy(dst, src, n) {
+          new Uint8Array(mem.buffer).copyWithin(dst, src, src + n); return dst;
+        },
+        memmove(dst, src, n) {
+          new Uint8Array(mem.buffer).copyWithin(dst, src, src + n); return dst;
+        },
+    }};
+    const { instance } = await WebAssembly.instantiate(bytes, imports);
+    mem = instance.exports.memory;
+
+    // Run the entry, then explicitly invoke whisk_gc_collect, then
+    // re-run a second time to verify the GC didn't break anything.
+    const r1 = instance.exports[process.argv[2]]($args_js);
+    instance.exports.whisk_gc_collect();
+    const r2 = instance.exports[process.argv[2]]($args_js);
+    instance.exports.whisk_gc_collect();
+    process.stdout.write(JSON.stringify({ r1: Number(r1), r2: Number(r2) }));
+    """
+    raw = read(`$NODE --input-type=module -e $js -- $wasm_path $entry`, String)
+    return raw
+end
+
 # ── Map JS's `String(x)` output back to a Julia value. We default to
 # Float64 if there's a decimal point, Int otherwise, and fall back to
 # the raw string. Callers can pin the type via `rettype = Float32` etc.

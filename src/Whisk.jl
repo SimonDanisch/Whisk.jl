@@ -25,7 +25,7 @@ include("compiler/reflection.jl")
 
 # --- runtime (compiled into every output module) -----------------------
 include("runtime/intrinsics.jl")
-include("runtime/allocator.jl")
+include("runtime/gc.jl")
 include("runtime/exceptions.jl")
 include("runtime/runtime.jl")
 
