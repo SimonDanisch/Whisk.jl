@@ -234,6 +234,7 @@ end
 function _emit_gc_alloc_memory!(mod::LLVM.Module)
     T_i32 = LLVM.Int32Type()
     T_i8p = LLVM.PointerType(LLVM.Int8Type())
+    T_i32p = LLVM.PointerType(T_i32)
 
     fn = if haskey(LLVM.functions(mod), "jl_alloc_genericmemory_unchecked")
         LLVM.functions(mod)["jl_alloc_genericmemory_unchecked"]
@@ -254,20 +255,26 @@ function _emit_gc_alloc_memory!(mod::LLVM.Module)
 
     @dispose b=LLVM.IRBuilder() begin
         LLVM.position!(b, entry)
+        # Memory{T} layout in wasm32 IR is `{ i32 length, ptr data }`
+        # (verified via Julia's emitted GEPs: `getelementptr inbounds
+        # { i32, ptr }, ..., i32 0, i32 1`). On wasm32 with 32-bit
+        # pointers that's 8 bytes total, with the data ptr at offset 4.
         ms_addr   = LLVM.call!(b, whisk_alloc_ft, whisk_alloc,
                                 [LLVM.ConstantInt(T_i32, 8)])
         data_addr = LLVM.call!(b, whisk_alloc_ft, whisk_alloc, [len_bytes])
 
-        ms_ptr   = LLVM.inttoptr!(b, ms_addr, T_i8p)
-        slot_ptr = LLVM.gep!(b, LLVM.Int8Type(), ms_ptr,
-                              [LLVM.ConstantInt(T_i32, 4)])
+        ms_byte_ptr = LLVM.inttoptr!(b, ms_addr, T_i8p)
+        slot_ptr    = LLVM.gep!(b, LLVM.Int8Type(), ms_byte_ptr,
+                                 [LLVM.ConstantInt(T_i32, 4)])
         LLVM.store!(b, data_addr, slot_ptr)
+        # Julia code overwrites the length field at offset 0 itself,
+        # so we don't pre-write it here.
 
         retval = if T_ret isa LLVM.IntegerType
             ms_addr
         else
-            ms_ptr0 = LLVM.inttoptr!(b, ms_addr, T_i8p)
-            LLVM.addrspacecast!(b, ms_ptr0, T_ret)
+            cast_ptr0 = LLVM.inttoptr!(b, ms_addr, T_i8p)
+            LLVM.addrspacecast!(b, cast_ptr0, T_ret)
         end
         LLVM.ret!(b, retval)
     end
@@ -724,6 +731,61 @@ function lower_gc_frame_intrinsics!(mod::LLVM.Module)
         end
         isempty(LLVM.uses(intr)) && LLVM.erase!(intr)
     end
+end
+
+"""
+    rewrite_host_pointer_constants!(mod::LLVM.Module)
+
+Julia's optimizer can constant-fold a foldable allocation
+(`Memory{T}(undef, 0)`, cached Symbols, type tags, etc.) to a host-VM
+object and bake the host process's address into the LLVM IR as an
+`inttoptr (ConstantInt to ptr)` literal. Those addresses are
+nonsense in wasm linear memory.
+
+In *Julia-emitted* IR, `inttoptr (Constant to ptr)` is unambiguously a
+host pointer — it only ever comes from `pointer_from_objref` getting
+baked in by const-prop. wasm-internal addresses come back as register
+values (calls to `whisk_gc_alloc`, GEPs, etc.), never as `inttoptr`
+of a literal. Our own emitted runtime code uses `inttoptr` only on
+register values, not on constants.
+
+So: every such constant gets rewritten to point at
+`@_whisk_empty_memory`, a single 16-byte zero buffer. Empty Memory{T}
+instances are observably identical (`length=0`, `ptr=null`); the same
+buffer covers them all. Non-Memory host objects that happen to flow
+here (Symbols, type tags) typically aren't dereferenced — they're
+passed as ignored ccall args — so the replacement is safe-by-default.
+"""
+function rewrite_host_pointer_constants!(mod::LLVM.Module)
+    empty_mem_name = "_whisk_empty_memory"
+    empty_buf = if haskey(LLVM.globals(mod), empty_mem_name)
+        LLVM.globals(mod)[empty_mem_name]
+    else
+        ty = LLVM.ArrayType(LLVM.Int8Type(), 16)
+        gv = LLVM.GlobalVariable(mod, ty, empty_mem_name)
+        LLVM.initializer!(gv, LLVM.null(ty))
+        LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
+        gv
+    end
+
+    seen = Set{LLVM.ConstantExpr}()
+    for fn in LLVM.functions(mod)
+        LLVM.isdeclaration(fn) && continue
+        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            for op in LLVM.operands(inst)
+                op isa LLVM.ConstantExpr || continue
+                LLVM.opcode(op) == LLVM.API.LLVMIntToPtr || continue
+                src = LLVM.operands(op)[1]
+                src isa LLVM.ConstantInt || continue
+                push!(seen, op)
+            end
+        end
+    end
+
+    for ce in seen
+        LLVM.replace_uses!(ce, empty_buf)
+    end
+    return length(seen)
 end
 
 """

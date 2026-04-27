@@ -60,10 +60,11 @@ GPUCompiler.runtime_slug(job::WasmCompilerJob) =
 # GPUCompiler's `lower_gc_frame!` pass which would otherwise call into
 # a host-typed `gc_pool_alloc(i64)`. wasm32 needs an i32 size.
 function GPUCompiler.finish_module!(job::WasmCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
-    emit_wasm_runtime!(mod)             # in-wasm allocator + Memory ctor
-    lower_gc_alloc_wasm32!(mod)         # julia.gc_alloc_obj → whisk_gc_alloc
-    lower_gc_frame_intrinsics!(mod)     # erase 1.11+ GC frame intrinsics
-    bypass_argument_error_checks!(mod)  # bypass mistruncated bounds checks
+    emit_wasm_runtime!(mod)                    # in-wasm allocator, Memory ctor, GC
+    lower_gc_alloc_wasm32!(mod)                # julia.gc_alloc_obj → whisk_gc_alloc
+    lower_gc_frame_intrinsics!(mod)            # 1.11+ GC frames → shadow stack
+    bypass_argument_error_checks!(mod)         # mistruncated wasm32 bounds checks
+    rewrite_host_pointer_constants!(mod)       # baked-in host-VM Memory singletons → @_whisk_empty_memory
     return entry
 end
 
