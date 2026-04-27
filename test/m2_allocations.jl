@@ -16,13 +16,11 @@ function alloc_and_first(n::Int32)::Int32
     return @inbounds v[1]
 end
 
-@testset "M2 · Vector{Int32}(undef, n) (broken until M2)" begin
-    @test_broken try
-        res = compile_module(alloc_and_first, Tuple{Int32}; name = "alloc_and_first")
-        run_export(res.wasm_path, res.entry_name, (Int32(8),)) == 42
-    catch
-        false
-    end
+@testset "M2 · Vector{Int32}(undef, n)" begin
+    @wasm_check alloc_and_first(Int32) [
+        (Int32(8),)  => 42,
+        (Int32(64),) => 42,
+    ] name = "alloc_and_first"
 end
 
 # Same shape for Float32 — separate codepath through Memory{Float32}.
@@ -32,13 +30,11 @@ function alloc_and_set(n::Int32)::Float32
     return @inbounds v[1]
 end
 
-@testset "M2 · Vector{Float32}(undef, n) (broken until M2)" begin
-    @test_broken try
-        res = compile_module(alloc_and_set, Tuple{Int32}; name = "alloc_and_set")
-        abs(run_export(res.wasm_path, res.entry_name, (Int32(4),)) - 3.14f0) < 1.0f-6
-    catch
-        false
-    end
+@testset "M2 · Vector{Float32}(undef, n)" begin
+    @wasm_check alloc_and_set(Int32) [
+        (Int32(4),)  => Float32(3.14),
+        (Int32(32),) => Float32(3.14),
+    ] name = "alloc_and_set"
 end
 
 # String operation that can't constant-fold (string from runtime input).

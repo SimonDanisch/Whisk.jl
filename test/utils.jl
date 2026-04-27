@@ -41,7 +41,39 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
     js = """
     import fs from 'node:fs';
     const bytes = fs.readFileSync(process.argv[1]);
-    const { instance } = await WebAssembly.instantiate(bytes, {});
+
+    // M2 bump-allocator shim. The wasm module exports its own memory; we
+    // close over a `mem` variable that gets filled in post-instantiate
+    // (allocator imports are only invoked during *runtime* calls, not at
+    // instantiation, so the late binding is fine).
+    let mem = null;
+    let heapNext = 65536;
+    const view = () => new DataView(mem.buffer);
+    const alloc_bytes = (n) => { const off = heapNext; heapNext += (n + 7) & ~7; return off; };
+    const imports = {
+      env: {
+        jl_alloc_genericmemory_unchecked(_ptls, len_bytes, _type) {
+          // Memory{T}: 8-byte struct (length::i32, data::ptr::i32) +
+          // separate `len_bytes`-sized data buffer. Julia writes the
+          // length itself; we set the data pointer.
+          const memStruct = alloc_bytes(8);
+          const data      = alloc_bytes(len_bytes);
+          view().setUint32(memStruct + 4, data, true);
+          return memStruct;
+        },
+        whisk_gc_alloc(sz) { return alloc_bytes(sz); },
+        jl_argument_error(_p) { throw new Error("argument error"); },
+        // GPUCompiler runtime stubs that get pulled in by error / oom
+        // paths. We trap on any of them — bounds errors etc. show as
+        // a wasm runtime error.
+        gpu_report_exception(_p) { throw new Error("gpu_report_exception"); },
+        gpu_report_oom(_sz) { throw new Error("gpu_report_oom"); },
+        gpu_signal_exception() { throw new Error("gpu_signal_exception"); },
+      },
+    };
+
+    const { instance } = await WebAssembly.instantiate(bytes, imports);
+    mem = instance.exports.memory;
     const r = instance.exports[process.argv[2]]($args_js);
     process.stdout.write(String(r));
     """

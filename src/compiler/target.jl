@@ -54,3 +54,30 @@ GPUCompiler.kernel_state_type(::WasmCompilerJob) = Nothing
 # triple + features so jobs differing in those don't share a cache.
 GPUCompiler.runtime_slug(job::WasmCompilerJob) =
     "wasm32-$(job.config.target.features)"
+
+# `finish_module!` runs AFTER IR generation but BEFORE optimize!, so
+# we can rewrite `julia.gc_alloc_obj` calls here — pre-empting
+# GPUCompiler's `lower_gc_frame!` pass which would otherwise call into
+# a host-typed `gc_pool_alloc(i64)`. wasm32 needs an i32 size.
+function GPUCompiler.finish_module!(job::WasmCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
+    lower_gc_alloc_wasm32!(mod)
+    lower_gc_frame_intrinsics!(mod)
+    bypass_argument_error_checks!(mod)
+    return entry
+end
+
+# Things we tell GPUCompiler's IR validator to *not* reject as
+# "unsupported call". They become wasm-imported functions or are
+# already lowered away by `finish_module!`. This is the same hook CUDA /
+# Metal / Abacus use for runtime-resolved symbols.
+const _whisk_intrinsics = Set([
+    "whisk_gc_alloc",                    # our allocator (wasm-import for M2)
+    "jl_alloc_genericmemory_unchecked",  # 1.11+ Memory{T} alloc — wasm import
+    "jl_argument_error",                 # error throw — wasm import / trap
+    "gpu_report_exception",              # GPUCompiler error stub
+    "gpu_report_oom",                    # OOM reporter
+    "gpu_signal_exception",
+    "memcpy", "memmove", "memset",
+])
+
+GPUCompiler.isintrinsic(::WasmCompilerJob, fn::String) = fn in _whisk_intrinsics
