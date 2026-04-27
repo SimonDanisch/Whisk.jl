@@ -1,0 +1,7 @@
+Manifest.toml
+test/Manifest.toml
+*.wasm
+*.wasm.js
+*.o
+.DS_Store
+.vscode/
