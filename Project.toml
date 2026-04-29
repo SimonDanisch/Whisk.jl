@@ -4,14 +4,16 @@ version = "0.0.1"
 authors = ["Simon"]
 
 [deps]
-GPUCompiler    = "61eb1bfa-7361-4325-ad38-22787b887f55"
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
-LLD_jll        = "d55e3150-da41-5e91-b323-ecfd1eec6109"
-LLVM           = "929cbde3-209d-540e-8aea-75f648917ca0"
-Libdl          = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 
 [compat]
-GPUCompiler    = "1.7"
+DataStructures = "0.18, 0.19"
+GPUCompiler = "1.7"
 IRStructurizer = "0.5"
-LLVM           = "9, 10"
-julia          = "1.12"
+LLVM = "9, 10"
+julia = "1.12"

@@ -51,3 +51,36 @@ end
         (Int32(50),) => 50,
     ] name = "dict_growth"
 end
+
+# Set is a thin Dict{T, Nothing} wrapper.
+function set_contains(x::Int32)::Int32
+    s = Set{UInt8}()
+    push!(s, 0x05)
+    push!(s, 0x10)
+    return unsafe_trunc(UInt8, x) in s ? Int32(1) : Int32(0)
+end
+
+@testset "M4 · Set{UInt8} push + in" begin
+    @wasm_check set_contains(Int32) [
+        (Int32(5),)  => 1,
+        (Int32(16),) => 1,
+        (Int32(7),)  => 0,
+        (Int32(0),)  => 0,
+    ] name = "set_contains"
+end
+
+# BitVector — bit-packed Vector{Bool}, exercises the Memory{UInt64}
+# storage with bit-level indexing in stdlib.
+function bitvec_set_get(n::Int32)::Int32
+    bv = falses(64)
+    @inbounds bv[Int(n)] = true
+    return Int32(@inbounds bv[Int(n)] ? 1 : 0)
+end
+
+@testset "M4 · BitVector falses + setindex! + getindex" begin
+    @wasm_check bitvec_set_get(Int32) [
+        (Int32(1),)  => 1,
+        (Int32(7),)  => 1,
+        (Int32(64),) => 1,
+    ] name = "bitvec_set_get"
+end

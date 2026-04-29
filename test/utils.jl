@@ -57,6 +57,17 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
         gpu_report_exception(_p) { throw new Error("gpu_report_exception"); },
         gpu_report_oom(_sz) { throw new Error("gpu_report_oom"); },
         gpu_signal_exception() { throw new Error("gpu_signal_exception"); },
+        // js_console(level, ptr, len) — Whisk's exception/log channel.
+        // level: 0=log, 1=warn, 2=error. UTF-8 bytes from linear memory.
+        js_console(level, ptr, len) {
+          const pn = N(ptr), ln = N(len);
+          const bytes = new Uint8Array(mem.buffer, pn, ln);
+          const msg = new TextDecoder('utf-8').decode(bytes);
+          const fn = level === 2 ? console.error
+                   : level === 1 ? console.warn
+                                 : console.log;
+          fn.call(console, "[wasm] " + msg);
+        },
         memset(p, val, n) {
           const pn = N(p), nn = N(n);
           new Uint8Array(mem.buffer).fill(Number(val) & 0xff, pn, pn + nn);
@@ -85,6 +96,42 @@ function run_export(wasm_path::AbstractString, entry::AbstractString, args;
 end
 
 """
+    run_blob_export(wasm_path, entry, blob; rettype = Int32) → value
+
+Place `blob` (a `Vector{UInt8}`) into wasm linear memory at a fixed
+high offset, call `entry(blob_ptr, blob_len)`, and parse the printed
+return as `rettype`. Used for `Whisk.Marshal` end-to-end tests where
+the wasm module needs raw bytes to decode.
+"""
+function run_blob_export(wasm_path::AbstractString, entry::AbstractString,
+                          blob::Vector{UInt8}; rettype::Type = Int32)
+    blob_hex = bytes2hex(blob)
+    js = """
+    import fs from 'node:fs';
+    const wasmBytes = fs.readFileSync(process.argv[1]);
+    const blob = Buffer.from(process.argv[3], 'hex');
+    let mem = null;
+    const N = (b) => typeof b === 'bigint' ? Number(b) : b;
+    const imports = { env: {
+        js_console(level, ptr, len) {
+            const m = new TextDecoder().decode(new Uint8Array(mem.buffer, N(ptr), N(len)));
+            (level === 2 ? console.error : console.log).call(console, "[wasm] " + m);
+        },
+        memmove(d, s, n) { new Uint8Array(mem.buffer).copyWithin(N(d), N(s), N(s) + N(n)); return d; },
+        memset(p, v, n) { new Uint8Array(mem.buffer).fill(Number(v) & 0xff, N(p), N(p) + N(n)); return p; },
+    }};
+    const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
+    mem = instance.exports.memory;
+    const off = 8 * 1024 * 1024;  // well past the wasm runtime's bump heap
+    new Uint8Array(mem.buffer).set(blob, off);
+    const r = instance.exports[process.argv[2]](BigInt(off), BigInt(blob.length));
+    process.stdout.write(String(r));
+    """
+    raw = read(`$NODE --input-type=module -e $js -- $wasm_path $entry $blob_hex`, String)
+    return parse(rettype, strip(raw))
+end
+
+"""
     inspect_gc(wasm_path) → NamedTuple
 
 Run a wasm module under JS that interleaves its main `call` with
@@ -99,11 +146,19 @@ function gc_probe(wasm_path::AbstractString, entry::AbstractString, args; rettyp
     import fs from 'node:fs';
     const bytes = fs.readFileSync(process.argv[1]);
     let mem = null;
+    const N = (b) => typeof b === 'bigint' ? Number(b) : b;
     const imports = { env: {
         jl_argument_error(_p) { throw new Error("argument error"); },
         gpu_report_exception(_p) { throw new Error("gpu_report_exception"); },
         gpu_report_oom(_sz) { throw new Error("gpu_report_oom"); },
         gpu_signal_exception() { throw new Error("gpu_signal_exception"); },
+        js_console(level, ptr, len) {
+          const pn = N(ptr), ln = N(len);
+          const bytes = new Uint8Array(mem.buffer, pn, ln);
+          const msg = new TextDecoder('utf-8').decode(bytes);
+          (level === 2 ? console.error : level === 1 ? console.warn : console.log)
+            .call(console, "[wasm] " + msg);
+        },
         memset(p, val, n) {
           new Uint8Array(mem.buffer).fill(val & 0xff, p, p + n); return p;
         },
@@ -127,6 +182,50 @@ function gc_probe(wasm_path::AbstractString, entry::AbstractString, args; rettyp
     """
     raw = read(`$NODE --input-type=module -e $js -- $wasm_path $entry`, String)
     return raw
+end
+
+"""
+    run_closure_export(wasm_path, closure_image, manifest, entry, args; rettype = nothing)
+
+Drive a wasm module that was compiled from a closure (callable struct
+with captured fields) — the path that auto-uploads `closure_image`,
+calls `whisk_set_closure_root`, and only then invokes `entry(args...)`.
+
+Loads `whisk.js` from the package source so the test exercises the
+real public JS API (not a duplicate of its internals).
+"""
+function run_closure_export(wasm_path::AbstractString,
+                              closure_image::Vector{UInt8},
+                              manifest,
+                              entry::AbstractString, args;
+                              rettype::Union{Type, Nothing} = nothing)
+    # wasm64 i64 args need JS BigInt literals; floats stay as Number.
+    args_js = join((a isa Integer ? string(Int(a)) * "n" : string(a)
+                    for a in args), ", ")
+    # whisk.js's `_resolveLayouts` only reads `manifest.tags[i].tag` to
+    # call `__whisk_layout_addr` on. We're generating JS source, not
+    # serialising for a wire — splat the tag IDs straight into a JS
+    # object literal.
+    tag_ids_js = manifest === nothing ? "[]" :
+                 "[" * join((string(t.tag) for t in manifest.tags), ", ") * "]"
+    img_hex = bytes2hex(closure_image)
+    whisk_js_url = "file://" * abspath(joinpath(@__DIR__, "..", "src",
+                                                  "jsinterop", "whisk.js"))
+    js = """
+    import fs from 'node:fs';
+    import { instantiate } from $(repr(whisk_js_url));
+    const wasmBytes = fs.readFileSync(process.argv[1]);
+    const closureBytes = Buffer.from(process.argv[3], 'hex');
+    const manifest = { tags: $tag_ids_js.map(t => ({ tag: t })) };
+    const wi = await instantiate(wasmBytes, {
+        manifest,
+        closureImage: closureBytes,
+    });
+    const r = wi.exports[process.argv[2]]($args_js);
+    process.stdout.write(String(r));
+    """
+    raw = read(`$NODE --input-type=module -e $js -- $wasm_path $entry $img_hex`, String)
+    return _parse_node_result(raw, rettype)
 end
 
 # ── Map JS's `String(x)` output back to a Julia value. We default to

@@ -37,18 +37,19 @@ end
     ] name = "alloc_and_set"
 end
 
-# String operation that can't constant-fold (string from runtime input).
-# Forces String overlay machinery onto the path.
+# Runtime string indexing — exercises the host-pointer rewrite for
+# `String` const-folded values.
 function string_byte(i::Int32)::UInt8
     s = "hello"
     @inbounds codeunit(s, Int(i))
 end
 
-@testset "M3/M4 · String codeunit (broken until later)" begin
-    @test_broken try
-        res = compile_module(string_byte, Tuple{Int32}; name = "string_byte")
-        run_export(res.wasm_path, res.entry_name, (Int32(1),)) == Int(UInt8('h'))
-    catch
-        false
-    end
+@testset "M4 · String codeunit on const-folded literal" begin
+    @wasm_check string_byte(Int32) [
+        (Int32(1),) => Int(UInt8('h')),
+        (Int32(2),) => Int(UInt8('e')),
+        (Int32(3),) => Int(UInt8('l')),
+        (Int32(4),) => Int(UInt8('l')),
+        (Int32(5),) => Int(UInt8('o')),
+    ] name = "string_byte"
 end
