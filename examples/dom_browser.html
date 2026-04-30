@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Whisk DOM WebAssembly Example</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f6f7f9;
+      color: #1f2933;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+
+    main {
+      width: min(560px, calc(100vw - 32px));
+      padding: 28px;
+      background: #ffffff;
+      border: 1px solid #d8dee8;
+      border-radius: 8px;
+      box-shadow: 0 18px 50px rgba(31, 41, 51, 0.12);
+    }
+
+    h1 {
+      margin: 0 0 18px;
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #344054;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+
+    input {
+      min-width: 0;
+      height: 42px;
+      padding: 0 12px;
+      border: 1px solid #b7c0cd;
+      border-radius: 6px;
+      font: inherit;
+    }
+
+    button {
+      height: 42px;
+      padding: 0 16px;
+      border: 0;
+      border-radius: 6px;
+      background: #136f63;
+      color: #ffffff;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: wait;
+      background: #8ba7a1;
+    }
+
+    dl {
+      display: grid;
+      grid-template-columns: 92px 1fr;
+      gap: 10px 14px;
+      margin: 22px 0 0;
+      padding-top: 18px;
+      border-top: 1px solid #e5e9f0;
+    }
+
+    dt {
+      color: #667085;
+      font-weight: 600;
+    }
+
+    dd {
+      margin: 0;
+      font-variant-numeric: tabular-nums;
+    }
+
+    #status.error {
+      color: #b42318;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Whisk WebAssembly DOM Example</h1>
+
+    <label for="input">Input</label>
+    <div class="row">
+      <input id="input" type="number" min="1" max="1000" step="1" value="10">
+      <button id="run" type="button" disabled>Run</button>
+    </div>
+
+    <dl aria-live="polite">
+      <dt>Status</dt>
+      <dd id="status">Loading wasm...</dd>
+      <dt>Call</dt>
+      <dd id="call">render_dom_score(10)</dd>
+      <dt>Result</dt>
+      <dd id="answer">-</dd>
+    </dl>
+  </main>
+
+  <script type="module">
+    const input = document.getElementById("input");
+    const button = document.getElementById("run");
+    const status = document.getElementById("status");
+    const call = document.getElementById("call");
+    const answer = document.getElementById("answer");
+
+    let instance = null;
+    let memory = null;
+    let nextNodeHandle = 1;
+    const nodesByHandle = new Map();
+    const handlesByNode = new WeakMap();
+    const N = (x) => typeof x === "bigint" ? Number(x) : x;
+
+    function setStatus(text, isError = false) {
+      status.textContent = text;
+      status.classList.toggle("error", isError);
+    }
+
+    const imports = {
+      env: {
+        jl_argument_error(_p) { throw new Error("argument error"); },
+        gpu_report_exception(_p) { throw new Error("gpu_report_exception"); },
+        gpu_report_oom(_sz) { throw new Error("gpu_report_oom"); },
+        gpu_signal_exception() { throw new Error("gpu_signal_exception"); },
+        dom_get_element_by_id(idCode) {
+          const id = Number(idCode) === 1 ? "answer" : "";
+          const node = document.getElementById(id);
+          if (!node) {
+            throw new Error(`missing DOM node for id code ${idCode}`);
+          }
+          let handle = handlesByNode.get(node);
+          if (handle === undefined) {
+            handle = nextNodeHandle++;
+            handlesByNode.set(node, handle);
+            nodesByHandle.set(handle, node);
+          }
+          return BigInt(handle);
+        },
+        dom_set_text_i32(handle, value) {
+          const node = nodesByHandle.get(N(handle));
+          if (!node) {
+            throw new Error(`unknown DOM node handle ${handle}`);
+          }
+          node.textContent = String(value);
+        },
+        js_console(level, ptr, len) {
+          const msg = new TextDecoder("utf-8")
+            .decode(new Uint8Array(memory.buffer, N(ptr), N(len)));
+          const log = level === 2 ? console.error
+                    : level === 1 ? console.warn
+                                  : console.log;
+          log.call(console, "[wasm] " + msg);
+        },
+        memset(p, value, n) {
+          new Uint8Array(memory.buffer).fill(Number(value) & 0xff, N(p), N(p) + N(n));
+          return p;
+        },
+        memcpy(dst, src, n) {
+          new Uint8Array(memory.buffer).copyWithin(N(dst), N(src), N(src) + N(n));
+          return dst;
+        },
+        memmove(dst, src, n) {
+          new Uint8Array(memory.buffer).copyWithin(N(dst), N(src), N(src) + N(n));
+          return dst;
+        },
+      },
+    };
+
+    async function loadWasm() {
+      if (location.protocol === "file:") {
+        throw new Error("Serve this directory over HTTP, then open dom_browser.html.");
+      }
+
+      const response = await fetch("dom_browser.wasm");
+      if (!response.ok) {
+        throw new Error(`failed to fetch dom_browser.wasm: ${response.status}`);
+      }
+
+      const bytes = await response.arrayBuffer();
+      const result = await WebAssembly.instantiate(bytes, imports);
+      instance = result.instance;
+      memory = instance.exports.memory;
+      button.disabled = false;
+      setStatus("Ready");
+    }
+
+    function run() {
+      const n = Math.max(1, Math.min(1000, Number.parseInt(input.value || "1", 10)));
+      input.value = String(n);
+      const result = instance.exports.render_dom_score(n);
+
+      call.textContent = `render_dom_score(${n})`;
+      setStatus(`Julia selected #answer and wrote ${result}`);
+    }
+
+    button.addEventListener("click", run);
+    input.addEventListener("input", () => {
+      call.textContent = `render_dom_score(${input.value || 0})`;
+    });
+
+    try {
+      await loadWasm();
+      run();
+    } catch (err) {
+      button.disabled = true;
+      setStatus(err.message, true);
+      console.error(err);
+    }
+  </script>
+</body>
+</html>

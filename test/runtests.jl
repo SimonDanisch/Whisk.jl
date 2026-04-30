@@ -20,4 +20,5 @@ include("utils.jl")
     include("m10_closure.jl")      # M10 — closure auto-marshal via image + setter
     include("m11_image.jl")        # M11 — host image-builder ↔ pointer_offsets agreement
     include("m12_image_gc.jl")     # M12 — image upload + pin + gc_collect e2e (#47)
+    include("m13_call_indirect.jl") # M13 — wasm call_indirect smoke test
 end

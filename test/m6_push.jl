@@ -19,9 +19,11 @@ function push_int_vec(::Int32)::Int32
 end
 
 @testset "M6 · push! Vector{Int32}, single element" begin
-    @wasm_check push_int_vec(Int32) [
+    res = @wasm_check push_int_vec(Int32) [
         (Int32(0),) => 7,
     ] name = "push_int_vec"
+    @test !occursin(r"(?m)^declare .*@i?jl_invoke\(", res.llvm_ir)
+    @test !occursin("addrspace(10)", res.llvm_ir)
 end
 
 # Multiple push!es in a row — exercises `_growend!` more than once and
