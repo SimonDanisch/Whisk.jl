@@ -371,8 +371,8 @@ function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
                    initial_memory::Integer = 16 * 1024 * 1024,                 # 16 MB
                    max_memory::Integer     = Int(4) * 1024 * 1024 * 1024,      # 4 GB (wasm64)
                    extra_exports::Vector{String} = String[])
-    lld     = _whisk_wasm_ld_path()
-    lib_dir = _whisk_libllvm_lib_dir()
+    lld      = _whisk_wasm_ld_path()
+    lib_dirs = String[_whisk_libllvm_lib_dir(), dirname(Zstd_jll.libzstd_path)]
     base_args = String[
         "-mwasm64",
         "--no-entry",
@@ -392,7 +392,7 @@ function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
                      "-o", wasm_path,
                      obj_path)
     cmd = Cmd(vcat([lld], base_args))
-    cmd = addenv(cmd, "LD_LIBRARY_PATH" => _ld_library_path_with(lib_dir))
+    cmd = _add_linker_library_path(cmd, lib_dirs)
     run(cmd)
     return wasm_path
 end
@@ -429,9 +429,19 @@ end
 
 _whisk_artifacts_toml() = normpath(joinpath(@__DIR__, "..", "..", "Artifacts.toml"))
 
-function _ld_library_path_with(extra::AbstractString)
-    cur = get(ENV, "LD_LIBRARY_PATH", "")
-    isempty(cur) ? extra : "$(extra):$(cur)"
+function _add_linker_library_path(cmd::Cmd, extras::Vector{String})
+    cmd = addenv(cmd, "LD_LIBRARY_PATH" => _library_path_with("LD_LIBRARY_PATH", extras))
+    if Sys.isapple()
+        cmd = addenv(cmd, "DYLD_LIBRARY_PATH" => _library_path_with("DYLD_LIBRARY_PATH", extras))
+    end
+    return cmd
+end
+
+function _library_path_with(name::String, extras::Vector{String})
+    sep = Sys.iswindows() ? ";" : ":"
+    extra_path = join(extras, sep)
+    cur = get(ENV, name, "")
+    isempty(cur) ? extra_path : "$(extra_path)$(sep)$(cur)"
 end
 
 """

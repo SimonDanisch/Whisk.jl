@@ -5,6 +5,7 @@ using LLVM
 using LLVM.Interop
 using Libdl
 using Pkg
+using Zstd_jll
 
 # WebAssembly target backends are present in Julia's bundled LLVM but not
 # initialised by default (only X86 is). Force-init at module load so
