@@ -5,3 +5,4 @@ test/Manifest.toml
 *.o
 .DS_Store
 .vscode/
+.worktrees/
