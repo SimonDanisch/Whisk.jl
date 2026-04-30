@@ -23,6 +23,11 @@
 ## these values — they only exist as type-check residue that
 ## optimization should have dropped when types are concrete.
 
+const _whisk_wasm_host_imports = Set([
+    "dom_get_element_by_id",
+    "dom_set_text_i32",
+])
+
 """
     scrub_host_globals!(mod) → Int
 
@@ -239,9 +244,9 @@ function redirect_julia_plt_to_wasm_runtime!(mod::LLVM.Module)
         init isa LLVM.Function || continue
         thunk = init
 
-        haskey(LLVM.functions(mod), target_name) || continue
-        target = LLVM.functions(mod)[target_name]
-        LLVM.isdeclaration(target) && continue
+        target = _wasm_host_import_or_runtime_target!(mod, target_name,
+                                                      LLVM.function_type(thunk))
+        target === nothing && continue
         target === thunk && continue
         LLVM.function_type(thunk) == LLVM.function_type(target) || continue
 
@@ -253,6 +258,20 @@ function redirect_julia_plt_to_wasm_runtime!(mod::LLVM.Module)
         n += 1
     end
     return n
+end
+
+function _wasm_host_import_or_runtime_target!(mod::LLVM.Module,
+                                               name::AbstractString,
+                                               fty::LLVM.FunctionType)
+    if haskey(LLVM.functions(mod), name)
+        target = LLVM.functions(mod)[name]
+        LLVM.function_type(target) == fty || return nothing
+        LLVM.isdeclaration(target) || return target
+        name in _whisk_wasm_host_imports && return target
+        return nothing
+    end
+    name in _whisk_wasm_host_imports || return nothing
+    return LLVM.Function(mod, String(name), fty)
 end
 
 """

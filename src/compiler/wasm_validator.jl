@@ -54,6 +54,7 @@ function validate_for_wasm!(mod::LLVM.Module)
     expected_imports = Set([
         "js_console", "memcpy", "memmove", "memset",
         "gpu_report_exception", "gpu_signal_exception",
+        "dom_get_element_by_id", "dom_set_text_i32",
         "whisk_dynamic_dispatch_unreached",
     ])
     for fn in LLVM.functions(mod)
@@ -148,10 +149,10 @@ function _classify_call!(call::LLVM.CallInst, parent_fn::LLVM.Function,
         return
     end
 
-    # Other indirect calls (real function-pointer args) — usually OK,
-    # but flag for attention.
-    push_diag(_with_loc(call,
-        "indirect call to non-Function callee (type = $(ftype)) — verify wasm-ld can lower this"))
+    # Other indirect calls are real function-pointer calls. The wasm64 link
+    # step normalises LLVM/LLD's table-index mismatch before the module reaches
+    # the runtime, so these are valid Whisk IR.
+    return
 end
 
 function _with_loc(inst::LLVM.Instruction, msg::String)

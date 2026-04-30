@@ -29,7 +29,8 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
                          name::Union{Nothing,String} = nothing,
                          optimize::Bool = true,
                          additional_exports = (),
-                         layout_tags = nothing)   # ::Union{Nothing, LayoutTagTable} — type defined later in include order
+                         layout_tags = nothing,   # ::Union{Nothing, LayoutTagTable} — type defined later in include order
+                         emit_indirect_probe::Bool = false)
     # Closures (callable structs with captured fields) compile fine, but the
     # resulting wasm function takes the closure object as its first arg.
     # Auto-marshal: encode `f` into an image alongside the wasm, generate a
@@ -86,6 +87,10 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
             emit_closure_wrapper!(mod, entry_f, entry_fn)
         end
 
+        if emit_indirect_probe
+            emit_call_indirect_probe!(mod)
+        end
+
         # Tag any additional helper functions reachable from the main
         # entry's call graph with their requested wasm-export-name.
         # This must run AFTER GPUCompiler.compile but BEFORE optimize
@@ -132,6 +137,7 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
         scrub_host_globals!(mod)
         lower_dynamic_dispatch!(mod)
         lower_trap_reports!(mod)
+        erase_unused_julia_invoke_declarations!(mod)
         # Per-tag descriptor address lookup, if the caller provided a
         # LayoutTagTable. Must run before clear_layout_cache! so the
         # descriptor cache is still warm (it shares globals with any
@@ -182,10 +188,14 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
         if has_closure
             push!(link_extras, "whisk_set_closure_root")
         end
+        if emit_indirect_probe
+            push!(link_extras, "whisk_call_indirect_probe")
+        end
         try
             link_wasm(obj_path, out_path;
                       entry_name = entry_fn,
-                      extra_exports = link_extras)
+                      extra_exports = link_extras,
+                      export_table = emit_indirect_probe)
         finally
             rm(obj_path; force = true)
         end
@@ -370,7 +380,8 @@ emitting an sret/byval struct argument and aborts with
 function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
                    initial_memory::Integer = 16 * 1024 * 1024,                 # 16 MB
                    max_memory::Integer     = Int(4) * 1024 * 1024 * 1024,      # 4 GB (wasm64)
-                   extra_exports::Vector{String} = String[])
+                   extra_exports::Vector{String} = String[],
+                   export_table::Bool = false)
     lld      = _whisk_wasm_ld_path()
     lib_dirs = String[_whisk_libllvm_lib_dir(), dirname(Zstd_jll.libzstd_path)]
     base_args = String[
@@ -386,6 +397,7 @@ function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
     for e in extra_exports
         push!(base_args, "--export=$e")
     end
+    export_table && push!(base_args, "--export-table")
     push!(base_args, "--allow-undefined",
                      "--initial-memory=$initial_memory",
                      "--max-memory=$max_memory",
@@ -394,6 +406,115 @@ function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
     cmd = Cmd(vcat([lld], base_args))
     cmd = _add_linker_library_path(cmd, lib_dirs)
     run(cmd)
+    _patch_wasm64_function_table_indices!(wasm_path)
+    return wasm_path
+end
+
+function _read_uleb(bytes::Vector{UInt8}, pos::Int)
+    value = UInt64(0)
+    shift = 0
+    start = pos
+    while true
+        pos > length(bytes) && error("Whisk: truncated wasm LEB at byte $start")
+        b = bytes[pos]
+        pos += 1
+        value |= UInt64(b & 0x7f) << shift
+        (b & 0x80) == 0 && return value, pos, start
+        shift += 7
+        shift > 63 && error("Whisk: oversized wasm LEB at byte $start")
+    end
+end
+
+function _skip_uleb(bytes::Vector{UInt8}, pos::Int)
+    _, pos, _ = _read_uleb(bytes, pos)
+    return pos
+end
+
+function _skip_wasm_limits(bytes::Vector{UInt8}, pos::Int, flags::UInt64)
+    pos = _skip_uleb(bytes, pos)             # min
+    (flags & 0x01) != 0 && (pos = _skip_uleb(bytes, pos))  # max
+    return pos
+end
+
+function _patch_wasm_const_expr_index!(bytes::Vector{UInt8}, pos::Int, section_end::Int)
+    pos > section_end && error("Whisk: truncated wasm const expression")
+    # LLVM lowers wasm64 indirect calls with an i32 table index. LLD 21 writes
+    # the active element offset as i64.const when linking `-mwasm64`; after
+    # changing the function table back to table32, that offset must be i32 too.
+    bytes[pos] == 0x42 && (bytes[pos] = 0x41) # i64.const -> i32.const
+    while true
+        pos > section_end && error("Whisk: unterminated wasm const expression")
+        b = bytes[pos]
+        pos += 1
+        b == 0x0b && return pos              # end
+    end
+end
+
+function _skip_wasm_elem_list(bytes::Vector{UInt8}, pos::Int, section_end::Int, expr_elems::Bool)
+    n, pos, _ = _read_uleb(bytes, pos)
+    for _ in 1:n
+        if expr_elems
+            pos = _patch_wasm_const_expr_index!(bytes, pos, section_end)
+        else
+            pos = _skip_uleb(bytes, pos)
+        end
+    end
+    return pos
+end
+
+function _patch_wasm64_function_table_indices!(wasm_path::String)
+    bytes = read(wasm_path)
+    length(bytes) >= 8 || return wasm_path
+    bytes[1:4] == UInt8[0x00, 0x61, 0x73, 0x6d] || return wasm_path
+
+    changed = false
+    pos = 9
+    while pos <= length(bytes)
+        section_id = bytes[pos]
+        pos += 1
+        section_len, pos, _ = _read_uleb(bytes, pos)
+        section_end = pos + Int(section_len) - 1
+        section_end <= length(bytes) || error("Whisk: truncated wasm section $section_id")
+
+        if section_id == 0x04 # table section
+            n, p, _ = _read_uleb(bytes, pos)
+            for _ in 1:n
+                p += 1 # reftype
+                flags, after_flags, flags_start = _read_uleb(bytes, p)
+                if (flags & 0x04) != 0
+                    after_flags == flags_start + 1 ||
+                        error("Whisk: cannot patch multi-byte wasm table flags")
+                    bytes[flags_start] = UInt8(flags & ~UInt64(0x04))
+                    changed = true
+                end
+                p = _skip_wasm_limits(bytes, after_flags, flags)
+            end
+        elseif section_id == 0x09 # element section
+            n, p, _ = _read_uleb(bytes, pos)
+            for _ in 1:n
+                flags, p, _ = _read_uleb(bytes, p)
+                expr_elems = (flags & 0x04) != 0
+                mode = flags & 0x03
+                if mode == 0x00
+                    p = _patch_wasm_const_expr_index!(bytes, p, section_end)
+                    p = _skip_wasm_elem_list(bytes, p, section_end, expr_elems)
+                elseif mode == 0x01 || mode == 0x03
+                    expr_elems || (p += 1) # elemkind
+                    p = _skip_wasm_elem_list(bytes, p, section_end, expr_elems)
+                elseif mode == 0x02
+                    p = _skip_uleb(bytes, p) # table index
+                    p = _patch_wasm_const_expr_index!(bytes, p, section_end)
+                    expr_elems || (p += 1) # elemkind
+                    p = _skip_wasm_elem_list(bytes, p, section_end, expr_elems)
+                end
+            end
+            changed = true
+        end
+
+        pos = section_end + 1
+    end
+
+    changed && write(wasm_path, bytes)
     return wasm_path
 end
 

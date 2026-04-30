@@ -101,6 +101,7 @@ function GPUCompiler.finish_ir!(job::WasmCompilerJob, mod::LLVM.Module, entry::L
     rewrite_host_pointer_constants!(mod)
     lower_dynamic_dispatch!(mod)
     lower_trap_reports!(mod)
+    erase_unused_julia_invoke_declarations!(mod)
     return entry
 end
 

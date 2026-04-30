@@ -141,8 +141,29 @@ function lower_invokes!(mod::LLVM.Module, target, params)
     end
 
     # If every ijl_invoke got rewritten, the declaration becomes unreferenced.
-    # Leave it for now — wasm-ld will dead-strip it.
     return n_lowered
+end
+
+"""
+    erase_unused_julia_invoke_declarations!(mod) → Int
+
+Drop stale Julia runtime dispatch declarations once Whisk's lowering passes
+have replaced their call sites. This keeps final IR diagnostics aligned with
+the linked wasm: if an `ijl_invoke`/`jl_apply_generic` symbol remains visible,
+it should indicate a real unresolved call, not a dead declaration that
+`wasm-ld` would silently strip.
+"""
+function erase_unused_julia_invoke_declarations!(mod::LLVM.Module)
+    n = 0
+    for name in ("ijl_invoke", "jl_invoke", "ijl_apply_generic", "jl_apply_generic")
+        haskey(LLVM.functions(mod), name) || continue
+        fn = LLVM.functions(mod)[name]
+        LLVM.isdeclaration(fn) || continue
+        iterate(LLVM.uses(fn)) === nothing || continue
+        LLVM.erase!(fn)
+        n += 1
+    end
+    return n
 end
 
 # Decode an ijl_invoke 4th-operand into the host-VM `MethodInstance`
