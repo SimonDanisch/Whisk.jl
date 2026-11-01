@@ -98,6 +98,67 @@ function _replace_dispatch_with_diagnostic!(call::LLVM.CallInst,
 end
 
 """
+    lower_noreturn_runtime_error!(mod, fname, fallback_msg) → Int
+
+Lower calls to a noreturn Julia runtime error entry point (e.g.
+`jl_argument_error(char*)`) into `js_console(error, "<file>:<line>:
+<msg>")` + `llvm.trap()`. The message is recovered from the call's
+constant-string operand when present, otherwise `fallback_msg`. The
+declaration is erased once unreferenced, so the symbol never becomes a
+wasm import. This is the standard treatment for every host-runtime
+throw entry: genuine runtime errors stay loud and source-located, and
+the module keeps zero host dependencies.
+"""
+function lower_noreturn_runtime_error!(mod::LLVM.Module, fname::String,
+                                        fallback_msg::String)
+    haskey(LLVM.functions(mod), fname) || return 0
+    fn = LLVM.functions(mod)[fname]
+    js_fn   = _get_or_declare_js_console!(mod)
+    trap_fn = _get_or_declare_trap!(mod)
+    n = 0
+    for use in collect(LLVM.uses(fn))
+        call = LLVM.user(use)
+        call isa LLVM.CallInst || continue
+        args = collect(LLVM.arguments(call))
+        msg = fallback_msg
+        if !isempty(args)
+            extracted = _extract_string_constant(args[1])
+            extracted !== nothing && (msg = String(extracted))
+        end
+        location = _dbg_location_string(call)
+        full = (isempty(location) ? "?:?" : location) * ": " * msg
+        str_gv = _intern_message_global!(mod, full)
+        @dispose b = LLVM.IRBuilder() begin
+            LLVM.position!(b, call)
+            LLVM.call!(b, LLVM.function_type(js_fn), js_fn, LLVM.Value[
+                LLVM.ConstantInt(LLVM.Int32Type(), 2),
+                str_gv,
+                LLVM.ConstantInt(LLVM.Int64Type(), sizeof(full)),
+            ])
+            LLVM.call!(b, LLVM.function_type(trap_fn), trap_fn, LLVM.Value[])
+        end
+        rt = LLVM.value_type(call)
+        rt != LLVM.VoidType() && LLVM.replace_uses!(call, LLVM.UndefValue(rt))
+        LLVM.erase!(call)
+        n += 1
+    end
+    isempty(LLVM.uses(fn)) && LLVM.erase!(fn)
+    return n
+end
+
+# Host-runtime noreturn error entries that may appear as externs. Each
+# gets the js_console + trap treatment; extend as new ones surface
+# (the validator turns any unlisted survivor into a hard finding).
+const NORETURN_RUNTIME_ERRORS = (
+    ("jl_argument_error",     "ArgumentError"),
+    ("ijl_argument_error",    "ArgumentError"),
+    ("jl_type_error",         "TypeError"),
+    ("ijl_type_error",        "TypeError"),
+    ("jl_bounds_error_unboxed_int", "BoundsError"),
+    ("ijl_bounds_error_unboxed_int", "BoundsError"),
+)
+
+"""
     lower_trap_reports!(mod) → Int
 
 Replace every `gpu_report_exception(ptr @msg)` call with a
@@ -135,6 +196,9 @@ function lower_trap_reports!(mod::LLVM.Module)
             call isa LLVM.CallInst || continue
             LLVM.erase!(call)
         end
+    end
+    for (fname, msg) in NORETURN_RUNTIME_ERRORS
+        n += lower_noreturn_runtime_error!(mod, fname, msg)
     end
     return n
 end

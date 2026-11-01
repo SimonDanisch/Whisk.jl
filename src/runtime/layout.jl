@@ -67,17 +67,16 @@ function pointer_offsets!(out::Vector{UInt64},
     for i in 1:nf
         ft = fieldtype(T, i)
         off = base + UInt64(fieldoffset(T, i))
-        if isbitstype(ft)
+        if ft isa DataType && isbitstype(ft)
             continue
-        elseif ismutabletype(ft) || ft <: Array || ft === String ||
-               ft <: Function || ft === Symbol
-            # Reference types: stored as a pointer at this offset.
-            push!(out, off)
-        elseif isconcretetype(ft) && !isabstracttype(ft)
-            # Immutable struct stored inline — recurse.
+        elseif ft isa DataType && Base.allocatedinline(ft)
+            # Inline-stored immutable with refs — recurse. Julia's own
+            # storage predicate; inline recursion cannot cycle (the
+            # type would have infinite size). The previous hand-rolled
+            # rule misclassified some types and recursed forever.
             pointer_offsets!(out, ft, off)
         else
-            # Catch-all for abstract/union fields: pointer at offset.
+            # Pointer-stored: mutable, abstract, union, ref types.
             push!(out, off)
         end
     end
@@ -102,17 +101,15 @@ function memory_element_layout(@nospecialize(memT::DataType))
     @assert memT <: Memory "expected Memory{T}, got $memT"
     # Memory{T}'s type parameters are (atomic_kind::Symbol, T, addrspace);
     # element type lives at position 2 in Julia 1.11+.
-    T = memT.parameters[2]::DataType
-    if isbitstype(T)
+    T = memT.parameters[2]   # may be a UnionAll/abstract (Memory{Type}, …)
+    if T isa DataType && isbitstype(T)
         return (UInt64(Base.aligned_sizeof(T)), UInt64[])
     end
-    # Box-vs-inline rule: mutable types and reference types are stored
-    # as 8-byte pointers; immutable concrete with refs are inline.
-    if ismutabletype(T) || T <: Array || T === String ||
-       T <: Function || T === Symbol
+    # Box-vs-inline per Julia's own storage predicate.
+    if !(T isa DataType) || !Base.allocatedinline(T)
         return (UInt64(8), UInt64[0])
     end
-    # Immutable concrete struct with pointer fields → inline storage.
+    # Inline-stored immutable struct with pointer fields.
     return (UInt64(Base.aligned_sizeof(T)), pointer_offsets(T))
 end
 
@@ -135,10 +132,13 @@ function _descriptor_cache(mod::LLVM.Module)
     # `objectid(mod)` for simplicity. Valid for one compile_to_wasm
     # invocation since we hold the module object the whole time.
     get!(_descriptor_cache_dict, objectid(mod)) do
-        Dict{Tuple{UInt64, Vector{UInt64}}, LLVM.GlobalVariable}()
+        # Values are global NAMES, not GlobalVariable handles —
+        # GPUCompiler's addrspace-removal pass clones every global
+        # (handles dangle across pipeline phases; names survive).
+        Dict{Tuple{UInt64, Vector{UInt64}}, String}()
     end
 end
-const _descriptor_cache_dict = Dict{UInt64, Dict{Tuple{UInt64, Vector{UInt64}}, LLVM.GlobalVariable}}()
+const _descriptor_cache_dict = Dict{UInt64, Dict{Tuple{UInt64, Vector{UInt64}}, String}}()
 
 """
     get_or_emit_layout_descriptor!(mod, elsz, ptr_offsets) → LLVM.GlobalVariable
@@ -155,16 +155,21 @@ function get_or_emit_layout_descriptor!(mod::LLVM.Module,
                                           ptr_offsets::Vector{UInt64})
     cache = _descriptor_cache(mod)
     key = (elsz, copy(ptr_offsets))
-    haskey(cache, key) && return cache[key]
+    if haskey(cache, key) && haskey(LLVM.globals(mod), cache[key])
+        return LLVM.globals(mod)[cache[key]]
+    end
 
     T_w = LLVM.Int64Type()
     n   = length(ptr_offsets)
-    arr_ty = LLVM.ArrayType(T_w, 2 + n)
+    arr_ty = LLVM.ArrayType(T_w, 3 + n)
 
-    # Build the constant array literal: [elsz, nptrs, off0, off1, ...]
+    # Constant array literal: [elsz, nptrs, objectid=0, off0, off1, …].
+    # The objectid slot at +16 is part of the descriptor header (tag
+    # switches load it); shape-keyed anonymous layouts carry 0.
     elements = LLVM.Constant[
         LLVM.ConstantInt(T_w, elsz),
         LLVM.ConstantInt(T_w, n),
+        LLVM.ConstantInt(T_w, 0),
     ]
     for off in ptr_offsets
         push!(elements, LLVM.ConstantInt(T_w, off))
@@ -188,7 +193,175 @@ function get_or_emit_layout_descriptor!(mod::LLVM.Module,
     # whose only references will be inserted by post-optimize passes.
     LLVM.API.LLVMAppendToUsed(mod, [gv], 1)
 
-    cache[key] = gv
+    cache[key] = name
+    return gv
+end
+
+## ── Unified per-type descriptors ─────────────────────────────────────
+##
+## One global per DataType that serves BOTH systems:
+##
+##   * GC layout: the mark walker reads the `{elsz, nptrs, offsets[]}`
+##     prefix exactly as before (it never reads past the offsets).
+##   * Runtime type identity: `obj[-8] & ~15` — the GC header's layout
+##     word — IS the Julia type tag. isa / typeassert compare sites
+##     (host DataType constants rewritten by
+##     `rewrite_host_pointer_constants!`), box type tags
+##     (`whisk_typetag_<T>` externs), and `whisk_gc_alloc_typed`
+##     headers all converge on this one address per type.
+##   * Runtime field access: appended metadata lets
+##     `ijl_get_nth_field_checked` walk fields of an `Any` value.
+##
+## Wire format (16-byte aligned; all words u64 unless noted):
+##
+##     +0:          elsz                  ┐ layout prefix —
+##     +8:          nptrs                 │ mark-walker contract
+##     +16:         objectid(T)           │ — FIXED slot: the stable
+##                                        │   runtime type id (tag
+##                                        │   switches & dispatch keys
+##                                        │   load it at tag+16)
+##     +24:         offsets[nptrs]        ┘
+##     +24+8n:      payload_size          ┐ type metadata
+##     +32+8n:      nfields               │
+##     +40+8n:      fields_off (from desc │   start; 0 = none)
+##     +48+8n:      name bytes + NUL, padded to 8
+##     fields_off:  nfields × { u64 offset, u64 field_desc, u64 kind }
+##                  kind 0 = pointer slot, 1 = inline (re-box via
+##                  field_desc), 2 = unsupported (helper traps)
+##
+## 16-byte alignment matters: Julia's tag compares mask `& ~15` while
+## the GC flags live in bits 0–2 of the header word — both need the
+## descriptor's low 4 bits clear.
+
+"""
+    whisk_type_descriptor!(mod, T::DataType) → LLVM.GlobalVariable
+
+Get-or-emit the unified type descriptor global for `T` (named
+`_whisk_type_<objectid hex>` — stable within a host session, so every
+emission path converges on the same global).
+
+Deduplication is BY NAME LOOKUP in the module, never via cached
+`GlobalVariable` handles: GPUCompiler's addrspace-removal pass CLONES
+every global after `finish_ir!` (handles created there dangle by the
+time the post-link pipeline runs — was a use-after-free SIGSEGV), but
+names survive the clone.
+"""
+# Reverse registry: descriptor global name → Julia type. Host-session
+# stable (names embed objectid), used by closed-world subtype lowering
+# to recover the abstract RHS of `jl_subtype` calls from IR constants.
+const DESCRIPTOR_NAME_TO_TYPE = Dict{String, DataType}()
+
+"""
+    descriptor_global_type(name) → DataType | nothing
+
+Resolve a descriptor global NAME back to its Julia type. Handles the
+`.N` suffix `LLVM.link!` appends when an internal global from a
+sub-module collides with one already in the destination.
+"""
+function descriptor_global_type(name::AbstractString)
+    T = get(DESCRIPTOR_NAME_TO_TYPE, name, nothing)
+    T !== nothing && return T
+    m = match(r"^(.*)\.\d+$", name)
+    m === nothing && return nothing
+    return get(DESCRIPTOR_NAME_TO_TYPE, m.captures[1], nothing)
+end
+
+function whisk_type_descriptor!(mod::LLVM.Module, @nospecialize(T::DataType))
+    name = "_whisk_type_" * string(objectid(T); base = 16)
+    DESCRIPTOR_NAME_TO_TYPE[name] = T
+    haskey(LLVM.globals(mod), name) && return LLVM.globals(mod)[name]
+
+    # Layout prefix — same semantics the shape-keyed descriptors had.
+    elsz, offsets = if T <: Memory
+        memory_element_layout(T)
+    elseif isbitstype(T) || (isconcretetype(T) && Base.datatype_pointerfree(T))
+        (UInt64(0), UInt64[])
+    else
+        (UInt64(0), pointer_offsets(T))
+    end
+
+    # Field metadata (fixed-size concrete structs only — Memory,
+    # String, Symbol and primitives have no Julia-visible fields the
+    # runtime helper should expose).
+    frecs = Tuple{UInt64, Union{Nothing, DataType}, UInt64}[]
+    if !(T <: Memory) && isconcretetype(T) && !isprimitivetype(T) &&
+       T !== Symbol && T !== String
+        for i in 1:fieldcount(T)
+            ft = fieldtype(T, i)
+            off = UInt64(fieldoffset(T, i))
+            if ft isa DataType && Base.allocatedinline(ft)
+                push!(frecs, (off, ft, UInt64(1)))      # inline — re-box
+            elseif ft isa Union && Base.allocatedinline(ft)
+                push!(frecs, (off, nothing, UInt64(2))) # inline union — unsupported
+            else
+                push!(frecs, (off, nothing, UInt64(0))) # pointer slot
+            end
+        end
+    end
+
+    label = codeunits(string(T))
+    name_padded = ((length(label) + 1 + 7) ÷ 8) * 8
+    n  = length(offsets)
+    nf = length(frecs)
+    fields_off = nf == 0 ? UInt64(0) : UInt64(24 + 8n + 24 + name_padded)
+
+    i8  = LLVM.Int8Type()
+    i64 = LLVM.Int64Type()
+    prefix_ty = LLVM.ArrayType(i64, 3 + n)
+    meta_ty   = LLVM.ArrayType(i64, 3)
+    name_ty   = LLVM.ArrayType(i8, name_padded)
+    fields_ty = LLVM.ArrayType(i64, 3nf)
+    struct_ty = LLVM.StructType([prefix_ty, meta_ty, name_ty, fields_ty])
+
+    # Create the (named) global BEFORE recursing into field
+    # descriptors — the name lookup above is the cycle guard. Inline-
+    # field recursion is acyclic anyway (a struct can't inline-contain
+    # itself).
+    gv = LLVM.GlobalVariable(mod, struct_ty, name)
+
+    prefix = LLVM.Constant[LLVM.ConstantInt(i64, reinterpret(Int64, elsz)),
+                           LLVM.ConstantInt(i64, n),
+                           LLVM.ConstantInt(i64, reinterpret(Int64, UInt64(objectid(T))))]
+    for off in offsets
+        push!(prefix, LLVM.ConstantInt(i64, reinterpret(Int64, off)))
+    end
+
+    payload_size = (T <: Memory || !isconcretetype(T)) ? UInt64(0) :
+                   UInt64(Base.aligned_sizeof(T))
+    meta = LLVM.Constant[
+        LLVM.ConstantInt(i64, reinterpret(Int64, payload_size)),
+        LLVM.ConstantInt(i64, nf),
+        LLVM.ConstantInt(i64, reinterpret(Int64, fields_off)),
+    ]
+
+    name_consts = LLVM.Constant[LLVM.ConstantInt(i8, 0) for _ in 1:name_padded]
+    for (j, bch) in enumerate(label)
+        name_consts[j] = LLVM.ConstantInt(i8, Int(bch))
+    end
+
+    fwords = LLVM.Constant[]
+    for (off, ft, kind) in frecs
+        push!(fwords, LLVM.ConstantInt(i64, reinterpret(Int64, off)))
+        if ft === nothing
+            push!(fwords, LLVM.ConstantInt(i64, 0))
+        else
+            push!(fwords, LLVM.const_ptrtoint(whisk_type_descriptor!(mod, ft), i64))
+        end
+        push!(fwords, LLVM.ConstantInt(i64, reinterpret(Int64, kind)))
+    end
+
+    fields_init = isempty(fwords) ? LLVM.null(fields_ty) :
+                                    LLVM.ConstantArray(i64, fwords)
+    LLVM.initializer!(gv, LLVM.ConstantStruct(struct_ty, LLVM.Constant[
+        LLVM.ConstantArray(i64, prefix),
+        LLVM.ConstantArray(i64, meta),
+        LLVM.ConstantArray(i8, name_consts),
+        fields_init,
+    ]))
+    LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
+    LLVM.constant!(gv, true)
+    LLVM.alignment!(gv, 16)
+    LLVM.API.LLVMAppendToUsed(mod, [gv], 1)
     return gv
 end
 
@@ -204,6 +377,12 @@ function clear_layout_cache!(mod::LLVM.Module)
     delete!(_descriptor_cache_dict, objectid(mod))
     _emit_layout_fallback_summary!(mod)
     delete!(_layout_fallback_log, objectid(mod))
+    let log = get(_reconstruct_fallback_log, objectid(mod), nothing)
+        if log !== nothing && !isempty(log)
+            @warn "Whisk: $(length(log)) host-pointer constant(s) could not be reconstructed (empty-buffer placeholder used). Comparisons/loads against these read zeros." sample = first(log, min(3, length(log)))
+        end
+        delete!(_reconstruct_fallback_log, objectid(mod))
+    end
 end
 
 # Per-module log of alloc sites where _decode_datatype_operand returned
@@ -226,7 +405,7 @@ function _emit_layout_fallback_summary!(mod::LLVM.Module)
     isempty(log) && return
     n = length(log)
     capped = n == _LAYOUT_FALLBACK_LOG_CAP ? "$(n)+" : "$(n)"
-    sample = first(log, min(3, length(log)))
+    sample = first(log, min(10, length(log)))
     @warn "Whisk GC: $capped alloc site(s) had untyped allocations (fallback to layout=0; raw-bytes mark). These are usually short-lived sub-compiled helper boxes; if a workload starts trapping with use-after-free symptoms, audit these sites." sample
     return
 end

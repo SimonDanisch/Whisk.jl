@@ -36,16 +36,28 @@ function scrub_host_globals!(mod::LLVM.Module)
             nm = LLVM.name(gv)
             if startswith(nm, "jl_")
                 ty = LLVM.global_value_type(gv)
-                LLVM.initializer!(gv, LLVM.null(ty))
+                # Singletons (`jl_true`, `jl_nothing`, …) point at a
+                # materialized instance; the rest are nulled (see
+                # `host_singleton_constant!` in runtime/gc.jl).
+                singleton = Whisk.host_singleton_constant!(mod, nm)
+                if singleton !== nothing && ty isa LLVM.PointerType
+                    LLVM.initializer!(gv, singleton)
+                else
+                    LLVM.initializer!(gv, LLVM.null(ty))
+                end
                 LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
                 n += 1
             end
             continue
         end
-        init = LLVM.initializer(gv)
-        init === nothing && continue
-        if init isa LLVM.ConstantExpr &&
-           LLVM.opcode(init) == LLVM.API.LLVMIntToPtr
+        # Raw-kind check before wrapping: exotic initializer kinds
+        # mis-dispatch in LLVM.jl's Value() (see the operand-loop note).
+        iref = LLVM.API.LLVMGetInitializer(gv)
+        iref == C_NULL && continue
+        LLVM.API.LLVMGetValueKind(iref) ==
+            LLVM.API.LLVMConstantExprValueKind || continue
+        init = LLVM.Value(iref)
+        if LLVM.opcode(init) == LLVM.API.LLVMIntToPtr
             ity = LLVM.value_type(init)
             LLVM.initializer!(gv, LLVM.null(ity))
             n += 1
@@ -95,6 +107,7 @@ function scrub_host_globals!(mod::LLVM.Module)
     end
 
     n += lower_julia_gc_intrinsics!(mod)
+    n += lower_exception_intrinsics!(mod)
     # Rebind any `jlplt_*` thunks for which we ship a wasm-side
     # runtime body BEFORE `lower_dlsym_calls!` traps every indirect
     # `jlplt_*` call site.
@@ -479,6 +492,117 @@ function _replace_dlsym_call_with_trap!(call::LLVM.CallInst,
 end
 
 """
+    lower_exception_intrinsics!(mod) → Int
+
+Lower Julia's try/catch runtime calls for wasm — **v1: fast-path
+only**. Julia lowers `try` to:
+
+    %state = call i64 @ijl_excstack_state(task)
+    %r     = call {i32, ptr} @julia.except_enter(task)   ; setjmp-like
+    br (extractvalue %r, 0) == 0 ? %try : %catch
+
+and `ijl_pop_handler[_noexcept](task, n)` on exit. Native Julia
+implements the exception edge with setjmp/longjmp, which wasm doesn't
+have. v1 semantics:
+
+  * `julia.except_enter` → `{i32 0, ptr null}` — the try body is
+    always entered; the catch edge becomes statically dead and DCE
+    removes it.
+  * `ijl_excstack_state` → `0`, `ijl_pop_handler*` → erased.
+  * a `throw` INSIDE a try still traps loudly (`js_console` +
+    `unreachable`) instead of transferring to the catch block.
+
+So try/finally and try/catch around non-throwing code compile and run;
+code that genuinely relies on catching keeps the loud-trap behaviour
+until real unwinding lands (wasm exnref EH — tracked as v2).
+"""
+function lower_exception_intrinsics!(mod::LLVM.Module)
+    n = 0
+    if haskey(LLVM.functions(mod), "julia.except_enter")
+        fn = LLVM.functions(mod)["julia.except_enter"]
+        rt = LLVM.return_type(LLVM.function_type(fn))
+        for use in collect(LLVM.uses(fn))
+            call = LLVM.user(use)
+            call isa LLVM.CallInst || continue
+            LLVM.replace_uses!(call, LLVM.null(rt))
+            LLVM.erase!(call)
+            n += 1
+        end
+        isempty(LLVM.uses(fn)) && LLVM.erase!(fn)
+    end
+    if haskey(LLVM.functions(mod), "ijl_excstack_state")
+        fn = LLVM.functions(mod)["ijl_excstack_state"]
+        rt = LLVM.return_type(LLVM.function_type(fn))
+        for use in collect(LLVM.uses(fn))
+            call = LLVM.user(use)
+            call isa LLVM.CallInst || continue
+            LLVM.replace_uses!(call, LLVM.null(rt))
+            LLVM.erase!(call)
+            n += 1
+        end
+        isempty(LLVM.uses(fn)) && LLVM.erase!(fn)
+    end
+    for fname in ("ijl_pop_handler", "ijl_pop_handler_noexcept")
+        haskey(LLVM.functions(mod), fname) || continue
+        fn = LLVM.functions(mod)[fname]
+        for use in collect(LLVM.uses(fn))
+            call = LLVM.user(use)
+            call isa LLVM.CallInst || continue
+            LLVM.erase!(call)
+            n += 1
+        end
+        isempty(LLVM.uses(fn)) && LLVM.erase!(fn)
+    end
+    return n
+end
+
+# The fixed set of box-able scalar types whose `whisk_typetag_<T>`
+# externs the runtime's `ijl_box_*` helpers reference (see
+# runtime/intrinsics.jl). Order is irrelevant; names must match the
+# `ccall("extern whisk_typetag_<T>", …)` symbols exactly.
+const BOX_TYPETAG_TYPES = (
+    Int64, Int32, Int16, Int8, UInt8, UInt16, UInt32, UInt64,
+    Float64, Float32, Char, Bool,
+)
+
+"""
+    define_box_typetags!(mod) → Int
+
+Define every *declared* `whisk_typetag_<T>` extern in `mod` with a
+one-instruction body: `ret i64 ptrtoint(@_whisk_type_<id>)`, where the
+global is the wasm-side DataType descriptor from
+`_make_wasm_datatype_global!`. That descriptor is the SAME global that
+`rewrite_host_pointer_constants!` substitutes at `isa`/typeassert
+tag-compare sites, so boxes tagged through these functions pass
+runtime type checks.
+
+Must run after all linking (`link_compiler_rt!` + `lower_invokes!`
+fixpoint) so every declaration is present, and before
+`validate_for_wasm!` (undefined externs are link errors). Functions
+for types nothing references get DCE'd by `wasm-ld`.
+"""
+function define_box_typetags!(mod::LLVM.Module)
+    n = 0
+    for T in BOX_TYPETAG_TYPES
+        fname = "whisk_typetag_$(T)"
+        haskey(LLVM.functions(mod), fname) || continue
+        fn = LLVM.functions(mod)[fname]
+        LLVM.isdeclaration(fn) || continue
+        dt_gv = Whisk._make_wasm_datatype_global!(mod, T)
+        entry = LLVM.BasicBlock(fn, "entry")
+        @dispose b = LLVM.IRBuilder() begin
+            LLVM.position!(b, entry)
+            addr = LLVM.ptrtoint!(b, dt_gv, LLVM.Int64Type())
+            LLVM.ret!(b, addr)
+        end
+        LLVM.linkage!(fn, LLVM.API.LLVMInternalLinkage)
+        push!(LLVM.function_attributes(fn), LLVM.EnumAttribute("alwaysinline", 0))
+        n += 1
+    end
+    return n
+end
+
+"""
     lower_julia_gc_intrinsics!(mod) → Int
 
 Lower the GC-related `@julia.*` intrinsics that GPUCompiler's
@@ -502,7 +626,51 @@ function lower_julia_gc_intrinsics!(mod::LLVM.Module)
     n += _replace_intrinsic_with_arg!(mod, "julia.pointer_from_objref", 1)
     n += _replace_intrinsic_with_arg!(mod, "julia.gc_loaded", 2)
     n += _erase_intrinsic_calls!(mod, "julia.write_barrier")
+    # `GC.@preserve` in sub-compiled runtime helpers leaves VARIADIC
+    # `llvm.julia.gc_preserve_begin(...)` / `_end(token)` calls behind
+    # (toplevel jobs have GPUCompiler strip them; toplevel=false skips
+    # that). The wasm backend SIGSEGVs in `getAlignment` on variadic
+    # calls, so erase them — Whisk's GC doesn't need preserve ranges
+    # (roots come from the gc-frame lowering). Order matters: `_end`
+    # consumes `_begin`'s token, so erase the ends first.
+    n += _erase_intrinsic_calls!(mod, "llvm.julia.gc_preserve_end")
+    n += _erase_intrinsic_calls!(mod, "llvm.julia.gc_preserve_begin")
     n += _lower_gc_alloc_obj!(mod)
+    n += lower_julia_typeof!(mod)
+    return n
+end
+
+# `julia.typeof(x)` — with unified descriptors the runtime type IS the
+# descriptor address in the header: lower to
+# `inttoptr(load(x - 8) & ~15)`. Downstream consumers (subtype checks,
+# tag switches, `===` on types) all operate on descriptor addresses.
+function lower_julia_typeof!(mod::LLVM.Module)
+    haskey(LLVM.functions(mod), "julia.typeof") || return 0
+    fn = LLVM.functions(mod)["julia.typeof"]
+    i64 = LLVM.Int64Type()
+    n = 0
+    for use in collect(LLVM.uses(fn))
+        call = LLVM.user(use)
+        call isa LLVM.CallInst || continue
+        args = collect(LLVM.arguments(call))
+        isempty(args) && continue
+        x = args[end]   # (task?, x) variants — value is the last arg
+        rt = LLVM.value_type(call)
+        @dispose b = LLVM.IRBuilder() begin
+            LLVM.position!(b, call)
+            x_int = LLVM.ptrtoint!(b, x, i64)
+            tag_p = LLVM.inttoptr!(b,
+                LLVM.sub!(b, x_int, LLVM.ConstantInt(i64, 8)),
+                LLVM.PointerType(i64))
+            tag = LLVM.and!(b, LLVM.load!(b, i64, tag_p),
+                             LLVM.ConstantInt(i64, -16))
+            res = LLVM.inttoptr!(b, tag, rt)
+            LLVM.replace_uses!(call, res)
+        end
+        LLVM.erase!(call)
+        n += 1
+    end
+    isempty(LLVM.uses(fn)) && LLVM.erase!(fn)
     return n
 end
 

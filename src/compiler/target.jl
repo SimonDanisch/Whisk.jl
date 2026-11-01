@@ -72,7 +72,11 @@ function GPUCompiler.finish_module!(job::WasmCompilerJob, mod::LLVM.Module, entr
     lower_gc_alloc_wasm!(mod)                  # julia.gc_alloc_obj → whisk_gc_alloc_typed
     lower_alloc_genericmemory!(mod)            # Memory<T> alloc with layout descriptor
     lower_gc_frame_intrinsics!(mod)            # 1.11+ GC frames → shadow stack
-    bypass_argument_error_checks!(mod)         # bypass mistruncated bounds checks
+    # DEBT(#diagnostics): silently removes branches into
+    # `jl_argument_error` ("mistruncated wasm bounds checks"). Once the
+    # mistruncation root cause is fixed, delete this — surviving calls
+    # are lowered loudly by `lower_noreturn_runtime_error!` instead.
+    bypass_argument_error_checks!(mod)
     return entry
 end
 
@@ -99,7 +103,11 @@ function GPUCompiler.finish_ir!(job::WasmCompilerJob, mod::LLVM.Module, entry::L
     lower_julia_call2!(mod)
     lower_invokes!(mod, job.config.target, job.config.params)
     rewrite_host_pointer_constants!(mod)
-    lower_dynamic_dispatch!(mod)
+    # Dynamic-dispatch sites are NOT trapped here: closed-world
+    # resolution (`lower_apply_generic!`, compilation.jl) runs after
+    # linking and must see live `ijl_apply_generic` calls. The trap
+    # fallback for unresolved sites runs late in compilation.jl.
+    # (Removed `lower_dynamic_dispatch!` — it pre-empted resolution.)
     lower_trap_reports!(mod)
     return entry
 end

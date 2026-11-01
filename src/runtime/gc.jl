@@ -292,7 +292,10 @@ function _emit_string_constructor!(mod::LLVM.Module, fn_name::String,
     src_ptr, len = LLVM.parameters(fn)
     entry = LLVM.BasicBlock(fn, "entry")
 
-    alloc_fn = LLVM.functions(mod)["whisk_gc_alloc"]   # (i64) -> i64
+    # Typed allocation — the GC-header layout word doubles as the
+    # Julia type tag, so runtime-built Strings pass `isa String`.
+    alloc_fn = LLVM.functions(mod)["whisk_gc_alloc_typed"]   # (i64, i64) -> i64
+    str_desc = whisk_type_descriptor!(mod, String)
     memcpy_fn = if haskey(LLVM.functions(mod), "memcpy")
         LLVM.functions(mod)["memcpy"]
     else
@@ -306,7 +309,8 @@ function _emit_string_constructor!(mod::LLVM.Module, fn_name::String,
         LLVM.position!(b, entry)
         # Payload = 8 bytes (length field) + len bytes (UTF-8 data).
         payload = LLVM.add!(b, len, LLVM.ConstantInt(T_w, 8))
-        addr_int = LLVM.call!(b, LLVM.function_type(alloc_fn), alloc_fn, [payload])
+        addr_int = LLVM.call!(b, LLVM.function_type(alloc_fn), alloc_fn,
+                               [payload, LLVM.const_ptrtoint(str_desc, T_w)])
         addr_ptr = LLVM.inttoptr!(b, addr_int, T_i8p)
         # Write length::i64 at offset 0.
         LLVM.store!(b, len, addr_ptr)
@@ -347,12 +351,14 @@ function _emit_ijl_alloc_string!(mod::LLVM.Module)
 
     len = LLVM.parameters(fn)[1]
     entry = LLVM.BasicBlock(fn, "entry")
-    alloc_fn = LLVM.functions(mod)["whisk_gc_alloc"]
+    alloc_fn = LLVM.functions(mod)["whisk_gc_alloc_typed"]
+    str_desc = whisk_type_descriptor!(mod, String)
 
     @dispose b=LLVM.IRBuilder() begin
         LLVM.position!(b, entry)
         payload = LLVM.add!(b, len, LLVM.ConstantInt(T_w, 8))
-        addr_int = LLVM.call!(b, LLVM.function_type(alloc_fn), alloc_fn, [payload])
+        addr_int = LLVM.call!(b, LLVM.function_type(alloc_fn), alloc_fn,
+                               [payload, LLVM.const_ptrtoint(str_desc, T_w)])
         addr_ptr = LLVM.inttoptr!(b, addr_int, T_i8p)
         LLVM.store!(b, len, addr_ptr)
         LLVM.ret!(b, addr_ptr)
@@ -530,7 +536,14 @@ function _emit_gc_alloc_typed!(mod, heap_base, heap_next, free_list)
                       LLVM.FunctionType(T_w, [T_w, T_w]))
     end
     LLVM.isdeclaration(fn) || return
-    LLVM.linkage!(fn, LLVM.API.LLVMInternalLinkage)
+    # External linkage: sub-compiled runtime helpers (`ijl_box_*`,
+    # `ijl_get_nth_field_checked`) call this via
+    # `ccall("extern whisk_gc_alloc_typed", …)` declarations that the
+    # module linker must bind — an internal-linkage definition gets
+    # renamed on link and leaves them dangling. Not exported from the
+    # final wasm (export set is the explicit --export list +
+    # wasm-export-name attributes).
+    LLVM.linkage!(fn, LLVM.API.LLVMExternalLinkage)
     push!(LLVM.function_attributes(fn), LLVM.EnumAttribute("noinline", 0))
 
     ensure_fn = if haskey(LLVM.functions(mod), "whisk_ensure_capacity")
@@ -977,7 +990,7 @@ function _emit_mark_drain!(mod, mark_stack, mark_top)
         nptrs_addr = LLVM.add!(b, layout_ptr, LLVM.ConstantInt(T_w, 8))
         nptrs_ptr  = LLVM.inttoptr!(b, nptrs_addr, T_wp)
         nptrs      = LLVM.load!(b, T_w, nptrs_ptr)
-        offsets_base = LLVM.add!(b, layout_ptr, LLVM.ConstantInt(T_w, 16))
+        offsets_base = LLVM.add!(b, layout_ptr, LLVM.ConstantInt(T_w, 24))
         is_memory  = LLVM.icmp!(b, LLVM.API.LLVMIntNE, elsz,
                                  LLVM.ConstantInt(T_w, 0))
         LLVM.br!(b, is_memory, setup_mem, setup_fix)
@@ -1580,6 +1593,17 @@ function lower_gc_alloc_wasm!(mod::LLVM.Module)
     isempty(LLVM.uses(alloc_obj)) && LLVM.erase!(alloc_obj)
 end
 
+# Walk through value casts (addrspacecast / bitcast, instruction or
+# ConstantExpr form) to the underlying value.
+function _peel_casts(operand)
+    while operand isa LLVM.Instruction || operand isa LLVM.ConstantExpr
+        oc = LLVM.opcode(operand)
+        (oc == LLVM.API.LLVMAddrSpaceCast || oc == LLVM.API.LLVMBitCast) || break
+        operand = LLVM.operands(operand)[1]
+    end
+    return operand
+end
+
 # Decode the type-pointer LLVM operand at a julia.gc_alloc_obj or
 # jl_alloc_genericmemory_unchecked call site to its Julia DataType.
 # Two shapes appear in practice:
@@ -1587,6 +1611,17 @@ end
 #   2. `load ptr, ptr @jl_global_NNN` — Julia's `julia.call2` lowering.
 # Returns the Julia DataType, or `nothing` if neither shape decodes.
 function _decode_datatype_operand(operand)
+    # A `_whisk_type_*` descriptor global IS the type's wasm identity:
+    # slots already processed by the host-pointer rewrite (sub-modules
+    # finalized during the lowering fixpoint) hold the descriptor
+    # directly instead of a host address. The registry maps it back.
+    if operand isa LLVM.GlobalVariable
+        T = descriptor_global_type(LLVM.name(operand))
+        T !== nothing && return T
+        init = LLVM.initializer(operand)
+        (init === nothing || init === operand) && return nothing
+        return _decode_datatype_operand(init)
+    end
     if operand isa LLVM.LoadInst
         ptr_op = LLVM.operands(operand)[1]
         ptr_op isa LLVM.GlobalVariable || return nothing
@@ -1594,21 +1629,42 @@ function _decode_datatype_operand(operand)
         init === nothing && return nothing
         return _decode_datatype_operand(init)
     end
-    if operand isa LLVM.ConstantExpr
-        LLVM.opcode(operand) == LLVM.API.LLVMIntToPtr || return nothing
-        addr_op = LLVM.operands(operand)[1]
-        addr_op isa LLVM.ConstantInt || return nothing
-        addr = convert(Int, addr_op)
-        addr <= 0x100000 && return nothing
-        addr % 8 != 0    && return nothing
-        obj = try
-            Base.unsafe_pointer_to_objref(Ptr{Nothing}(addr))
-        catch
-            return nothing
+    # Peel value conversions — Julia codegen wraps the type operand in
+    # `addrspacecast` / `bitcast`, and in sub-compiled bodies the
+    # pointer round-trips through `ptrtoint`/`inttoptr` INSTRUCTIONS
+    # (`%x = inttoptr i64 %Tuple to ptr` where `%Tuple` is an i64 load
+    # of a `@jl_global` slot).
+    if operand isa LLVM.Instruction
+        oc = LLVM.opcode(operand)
+        if oc == LLVM.API.LLVMAddrSpaceCast || oc == LLVM.API.LLVMBitCast ||
+           oc == LLVM.API.LLVMIntToPtr || oc == LLVM.API.LLVMPtrToInt
+            return _decode_datatype_operand(LLVM.operands(operand)[1])
         end
-        return obj isa DataType ? obj : nothing
+        return nothing
+    end
+    if operand isa LLVM.ConstantInt
+        return _datatype_from_host_addr(convert(Int, operand))
+    end
+    if operand isa LLVM.ConstantExpr
+        oc = LLVM.opcode(operand)
+        if oc == LLVM.API.LLVMAddrSpaceCast || oc == LLVM.API.LLVMBitCast ||
+           oc == LLVM.API.LLVMIntToPtr || oc == LLVM.API.LLVMPtrToInt
+            return _decode_datatype_operand(LLVM.operands(operand)[1])
+        end
+        return nothing
     end
     return nothing
+end
+
+function _datatype_from_host_addr(addr::Int)
+    addr <= 0x100000 && return nothing
+    addr % 8 != 0    && return nothing
+    obj = try
+        Base.unsafe_pointer_to_objref(Ptr{Nothing}(addr))
+    catch
+        return nothing
+    end
+    return obj isa DataType ? obj : nothing
 end
 
 # Resolve the LLVM i64 layout-pointer value for a type-operand at an
@@ -1630,26 +1686,55 @@ function _layout_value_for_type_operand!(mod::LLVM.Module, operand, as_memory::B
         # Track for end-of-compile summary; the fallback's correctness
         # depends on the alloc site not actually containing live heap
         # pointers (sub-compiled helpers' short-lived boxes typically
-        # don't, but it's not a guarantee).
-        _record_layout_fallback!(mod, operand, as_memory)
-        return LLVM.ConstantInt(T_w, 0)
-    end
-    elsz, offsets = if as_memory
-        memory_element_layout(ty)
-    else
-        # Fixed-size object: elsz = 0 (sentinel), offsets within payload.
-        if isbitstype(ty) || Base.datatype_pointerfree(ty)
-            return LLVM.ConstantInt(T_w, 0)
+        # don't, but it's not a guarantee). Log the PEELED terminal
+        # operand plus its enclosing function so the summary tells us
+        # which codegen shape to teach the decoder next.
+        term = _peel_casts(operand)
+        ctx = try
+            if term isa LLVM.Argument
+                string("arg of ", LLVM.name(LLVM.parent(term)), ": ", string(term))
+            elseif term isa LLVM.Instruction
+                string("in ", LLVM.name(LLVM.parent(LLVM.parent(term))), ": ", string(term))
+            else
+                string(term)
+            end
+        catch
+            string(operand)
         end
-        (UInt64(0), pointer_offsets(ty))
-    end
-    if isempty(offsets)
-        # Pointer-free element (e.g. Memory{Float32}, bits Tuple). No
-        # warning: the mark walker has nothing useful to do with the
-        # bytes and layout=0 makes that explicit + a touch faster.
+        # When the terminal shape loads a global slot, append what the
+        # slot holds — the summary then names the exact decoder gap
+        # (missing initializer vs. unrecognised initializer object).
+        if term isa LLVM.LoadInst
+            g = LLVM.operands(term)[1]
+            if g isa LLVM.GlobalVariable
+                iref = LLVM.API.LLVMGetInitializer(g)
+                ctx *= if iref == C_NULL
+                    " [slot has NO initializer]"
+                else
+                    kind = LLVM.API.LLVMGetValueKind(iref)
+                    inits = try string(LLVM.Value(iref)) catch; "?" end
+                    obj = try
+                        o = _decode_datatype_operand(LLVM.Value(iref))
+                        o === nothing ? begin
+                            ho = decode_host_object(LLVM.Value(iref))
+                            ho === nothing ? "undecodable" : string("non-DataType ", typeof(ho))
+                        end : string("DataType ", o)
+                    catch
+                        "decode threw"
+                    end
+                    string(" [slot init kind=", kind, " ", inits, " → ", obj, "]")
+                end
+            end
+        end
+        _record_layout_fallback!(mod, ctx, as_memory)
         return LLVM.ConstantInt(T_w, 0)
     end
-    descriptor = get_or_emit_layout_descriptor!(mod, elsz, offsets)
+    # Unified per-type descriptor — even for pointer-free types. The
+    # mark walker's cost is unchanged (nptrs == 0 → zero iterations),
+    # and the header word doubles as the Julia type tag: isa /
+    # typeassert / typeof and `ijl_get_nth_field_checked` work on any
+    # heap object allocated through the typed path.
+    descriptor = whisk_type_descriptor!(mod, ty)
     return LLVM.const_ptrtoint(descriptor, T_w)
 end
 
@@ -1906,12 +1991,40 @@ function rewrite_host_pointer_constants!(mod::LLVM.Module)
     for fn in LLVM.functions(mod)
         LLVM.isdeclaration(fn) && continue
         for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
-            for (i, op) in enumerate(LLVM.operands(inst))
-                op isa LLVM.ConstantExpr || continue
+            # Check the RAW value kind before wrapping each operand:
+            # exotic operand kinds (metadata-as-value on LLVM-18 debug
+            # records, etc.) mis-dispatch inside LLVM.jl's `Value()`
+            # constructor (`@inbounds` opcode-table read on a
+            # non-instruction → garbage type → MethodError). We only
+            # care about ConstantExpr operands here anyway.
+            nops = LLVM.API.LLVMGetNumOperands(inst)
+            for i in 1:nops
+                opref = LLVM.API.LLVMGetOperand(inst, i - 1)
+                opref == C_NULL && continue
+                LLVM.API.LLVMGetValueKind(opref) ==
+                    LLVM.API.LLVMConstantExprValueKind || continue
+                op = LLVM.Value(opref)
                 LLVM.opcode(op) == LLVM.API.LLVMIntToPtr || continue
                 src = LLVM.operands(op)[1]
                 src isa LLVM.ConstantInt || continue
                 host_addr = convert(Int, src)
+                if 0 < host_addr < 4096
+                    # Small typetag constants: only EQUALITY compares
+                    # are type-identity contexts; ordered compares are
+                    # range guards whose numeric value must survive.
+                    is_eq = LLVM.opcode(inst) == LLVM.API.LLVMICmp &&
+                            (LLVM.API.LLVMGetICmpPredicate(inst) ==
+                                 LLVM.API.LLVMIntEQ ||
+                             LLVM.API.LLVMGetICmpPredicate(inst) ==
+                                 LLVM.API.LLVMIntNE)
+                    is_eq || continue
+                    dt = _small_typetag_to_datatype(host_addr)
+                    dt === nothing && continue
+                    LLVM.API.LLVMSetOperand(inst, i - 1,
+                        whisk_type_descriptor!(mod, dt))
+                    n += 1
+                    continue
+                end
                 replacement = get!(replacements, host_addr) do
                     _reconstruct_host_object_in_wasm!(mod, host_addr, empty_buf)
                 end
@@ -1921,21 +2034,49 @@ function rewrite_host_pointer_constants!(mod::LLVM.Module)
         end
     end
 
+    # Type-tag SWITCHES and integer compares: isa chains over ≥2 types
+    # compile to `switch i64 %tag, …` (and short chains to
+    # `icmp eq i64 %tag, C`) where the case values are PLAIN i64
+    # constants — raw host DataType addresses or small typetags, not
+    # inttoptr exprs. Rewrite every such constant that resolves to a
+    # type into `ptrtoint` of its descriptor. The scrutinee must match
+    # the tag idiom (`and(load(p), -16)`) so unrelated integer
+    # switches are never touched; a constant that fails resolution is
+    # left in place (a host address can never equal a wasm address —
+    # the case is dead, matching host semantics).
+    n += rewrite_tag_compare_constants!(mod)
+
     # Julia's frontend also seeds module globals with host-pointer
-    # initializers — these are the `@jl_global_NNNN = internal global
-    # ptr inttoptr (i64 ADDR to ptr)` lines that appear after irgen for
-    # type tags / `Type{T}` references / etc. Walk every global and
-    # neuter such initializers: an inttoptr to a host VM address is
-    # never valid in our wasm module, so substitute a null pointer.
-    # The runtime never reads these for the current code paths (they
-    # exist as defensive type-check material that the optimizer drops
-    # when types are concrete), but leaving them as host pointers
-    # produces invalid wasm relocations at link time.
+    # initializers — the `@jl_global_NNNN = internal global ptr
+    # inttoptr (i64 ADDR to ptr)` lines that appear after irgen for
+    # type tags / `Type{T}` references / interned data (Strings,
+    # Symbols, …). Try the same reconstruction as for instruction
+    # operands first — a recognised object (String literal, Symbol,
+    # DataType, …) becomes a real wasm global and code loading through
+    # the `@jl_global` slot sees valid data. Only when reconstruction
+    # fails do we neuter the initializer to null (host addresses are
+    # never valid wasm relocations).
     for gv in collect(LLVM.globals(mod))
-        init = LLVM.initializer(gv)
-        init === nothing && continue
-        if init isa LLVM.ConstantExpr &&
-           LLVM.opcode(init) == LLVM.API.LLVMIntToPtr
+        # Raw-kind check before wrapping: exotic initializer kinds
+        # mis-dispatch in LLVM.jl's Value() (see the operand-loop note).
+        iref = LLVM.API.LLVMGetInitializer(gv)
+        iref == C_NULL && continue
+        LLVM.API.LLVMGetValueKind(iref) ==
+            LLVM.API.LLVMConstantExprValueKind || continue
+        init = LLVM.Value(iref)
+        if LLVM.opcode(init) == LLVM.API.LLVMIntToPtr
+            src = LLVM.operands(init)[1]
+            if src isa LLVM.ConstantInt
+                host_addr = convert(Int, src)
+                replacement = get!(replacements, host_addr) do
+                    _reconstruct_host_object_in_wasm!(mod, host_addr, empty_buf)
+                end
+                if replacement !== empty_buf
+                    LLVM.initializer!(gv, replacement)
+                    n += 1
+                    continue
+                end
+            end
             ity = LLVM.value_type(init)
             null_val = LLVM.null(ity)
             LLVM.initializer!(gv, null_val)
@@ -1945,21 +2086,58 @@ function rewrite_host_pointer_constants!(mod::LLVM.Module)
         end
     end
 
-    # Same story for `external` declarations of `jl_*` host symbols
-    # (`@jl_small_typeof`, `@jl_nothing`, `@jl_int64_type`, etc.). Make
-    # them internal globals with a null/zero initializer of the
-    # declared type so wasm-ld doesn't try to resolve a host symbol.
+    # `external` declarations of `jl_*` host symbols. SINGLETON
+    # globals (`@jl_true`, `@jl_nothing`, …) are C variables holding a
+    # pointer to the canonical instance — codegen loads literals
+    # through them, so they get a real initializer pointing at the
+    # materialized instance (nulling them silently stored NULL into
+    # Vector{Any}/Dict slots — found via `attrs[:visible] = true`).
+    # Everything else (`@jl_small_typeof`, `@jl_int64_type`, …) is
+    # nulled as before: those are tag-machinery the descriptor system
+    # replaces wholesale.
     for gv in collect(LLVM.globals(mod))
         LLVM.isdeclaration(gv) || continue
         nm = LLVM.name(gv)
         startswith(nm, "jl_") || continue
         ty = LLVM.global_value_type(gv)
-        LLVM.initializer!(gv, LLVM.null(ty))
+        singleton = host_singleton_constant!(mod, nm)
+        if singleton !== nothing && ty isa LLVM.PointerType
+            LLVM.initializer!(gv, singleton)
+        else
+            LLVM.initializer!(gv, LLVM.null(ty))
+        end
         LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
         n += 1
     end
 
     return n
+end
+
+# Julia C-runtime singleton globals: each is a C variable holding a
+# pointer to the canonical instance (`jl_true` → the boxed `true`).
+# Returns the materialized instance constant, or `nothing` for
+# non-singleton names. The host instance address keys the dedup, so
+# baked direct pointers to the same singleton converge on the same
+# wasm global.
+function host_singleton_constant!(mod::LLVM.Module, nm::String)
+    p = if nm == "jl_true"
+        unsafe_load(cglobal(:jl_true, Ptr{Cvoid}))
+    elseif nm == "jl_false"
+        unsafe_load(cglobal(:jl_false, Ptr{Cvoid}))
+    elseif nm == "jl_nothing"
+        unsafe_load(cglobal(:jl_nothing, Ptr{Cvoid}))
+    elseif nm == "jl_emptytuple"
+        unsafe_load(cglobal(:jl_emptytuple, Ptr{Cvoid}))
+    else
+        return nothing
+    end
+    p == C_NULL && return nothing
+    obj = try
+        Base.unsafe_pointer_to_objref(p)
+    catch
+        return nothing
+    end
+    return _materialize_host_object!(mod, obj, Int(UInt(p)))
 end
 
 function _get_or_make_empty_buf!(mod)
@@ -1975,191 +2153,622 @@ function _get_or_make_empty_buf!(mod)
 end
 
 # Try to read the host-VM object the address points at and snapshot
-# it into a wasm global. Returns the global to replace `inttoptr addr`
+# it into a wasm global. Returns the constant to replace `inttoptr addr`
 # uses with. Falls back to the shared empty buffer when we can't
 # identify or don't support the host object's type.
+#
+# Julia 1.12 codegen bakes INTERIOR pointers, not just object base
+# pointers: a const-folded `codeunit(s, i)` references the String's
+# data at S+8 directly; `Vector` literals reference the Memory's
+# data-ptr field at M+8 or its inline data at M+16. So: probe
+# backwards from the address (deltas 0, 8, 16) for a tag-validated
+# enclosing object, materialise it as a layout-faithful wasm global,
+# and replace interior references with a const-GEP at the same byte
+# offset. Layout-faithful means the global mirrors the host object's
+# exact byte layout (real length header, inline data), so any interior
+# offset maps 1:1.
 function _reconstruct_host_object_in_wasm!(mod::LLVM.Module, host_addr::Int, empty_buf)
     # Defensive: `unsafe_pointer_to_objref` is genuinely unsafe and can
     # SIGSEGV (try/catch doesn't help — segfaults bypass Julia's
-    # exception machinery). Filter obvious non-objects first:
-    #   * Address must be 16-byte-aligned (Julia heap alignment).
-    #   * Address must be in a reasonable range (not a small int that
-    #     happened to look like a pointer).
-    # Then deref behind a try; treat any error or "not Memory/String"
-    # as a safe fallback to the empty buffer.
-    host_addr <= 0x100000      && return empty_buf
-    host_addr % 16 != 0        && return empty_buf
-
-    obj = try
-        unsafe_pointer_to_objref(Ptr{Nothing}(host_addr))
-    catch
-        return empty_buf
-    end
-    if obj isa Memory{UInt8}
-        return _make_wasm_memory_u8_global!(mod, obj, host_addr)
-    elseif obj isa String
-        return _make_wasm_string_global!(mod, codeunits(obj), host_addr)
-    elseif obj isa Memory && isbitstype(eltype(obj))
-        # Memory{T<:bitstype}: same shape as Memory{UInt8}; reuse the
-        # byte-buffer machinery on the underlying bytes.
-        T = eltype(obj)
-        n = length(obj) * sizeof(T)
-        bytes = Vector{UInt8}(undef, n)
-        if n > 0
-            GC.@preserve obj bytes begin
-                ccall(:memcpy, Ptr{Cvoid},
-                    (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
-                    pointer(bytes),
-                    Base.unsafe_convert(Ptr{T}, obj),
-                    Csize_t(n))
-            end
+    # exception machinery). `_identify_host_object` validates the type
+    # tag (two-level: tag word → DataType → DataType's own tag) before
+    # dereferencing; small ints that happen to look like pointers are
+    # filtered by the range check here.
+    # Small constants are NOT objects. Small TYPETAGS (< 4096) are
+    # only meaningful in EQUALITY tag-compare contexts — the
+    # context-aware callers (`rewrite_tag_compare_constants!` and the
+    # eq/ne icmp special-case in the instruction loop) map those via
+    # `_small_typetag_to_datatype`. Mapping them here unconditionally
+    # rewrote the inline-typeof RANGE guard (`icmp ult tag, BOUND`)
+    # into a descriptor compare — always-true garbage.
+    host_addr <= 0x100000 && return empty_buf
+    ua = UInt(host_addr)
+    for delta in (UInt(0), UInt(8), UInt(16))
+        delta < ua || break
+        base = ua - delta
+        # 8-byte alignment, not 16: perm-allocated objects (Symbols!)
+        # are only 8-aligned. The two-level type-tag check inside
+        # `_identify_host_object` is the actual validity filter.
+        base % 8 == 0 || continue
+        obj = _identify_host_object(base)
+        obj === nothing && continue
+        g = _materialize_host_object!(mod, obj, Int(base))
+        # Identified a real object but of an unsupported type — probing
+        # further back can't find a *different* enclosing object, so
+        # fall back now.
+        if g === nothing
+            _record_reconstruct_fallback!(mod, host_addr, obj)
+            return empty_buf
         end
-        return _make_wasm_memory_u8_global!(mod, bytes, host_addr)
-    elseif obj isa Vector && isbitstype(eltype(obj))
-        return _make_wasm_vector_bits_global!(mod, obj, host_addr)
+        delta == 0 && return g
+        return LLVM.const_inbounds_gep(LLVM.Int8Type(), g,
+            [LLVM.ConstantInt(LLVM.Int64Type(), Int(delta))])
     end
+    _record_reconstruct_fallback!(mod, host_addr, nothing)
     return empty_buf
 end
 
-# Build (or reuse) a wasm global that materialises a `Memory{UInt8}`
-# layout: 16-byte struct { i64 length, ptr data } followed by the
-# actual data bytes. The struct's `data` field points at the inline
-# bytes that immediately follow it.
-const _WASM_MEMORY_GLOBAL_CACHE = IdDict{LLVM.Module, Dict{Int, Any}}()
+# Per-module log of host-pointer constants that could not be
+# reconstructed (unidentifiable address, or identified object of an
+# unsupported type). Summarised by `clear_layout_cache!` alongside the
+# layout fallbacks — rising counts here mean wasm code is comparing /
+# loading against `_whisk_empty_memory` placeholders.
+const _reconstruct_fallback_log = Dict{UInt64, Vector{String}}()
 
-function _make_wasm_vector_bits_global!(mod::LLVM.Module, vec, host_addr::Int)
-    cache = get!(() -> Dict{Int, Any}(), _WASM_MEMORY_GLOBAL_CACHE, mod)
-    haskey(cache, host_addr) && return cache[host_addr]
+function _record_reconstruct_fallback!(mod::LLVM.Module, host_addr::Int,
+                                        @nospecialize(obj))
+    log = get!(() -> String[], _reconstruct_fallback_log, objectid(mod))
+    if length(log) < _LAYOUT_FALLBACK_LOG_CAP
+        # NEVER `repr`/`show` the object — it came from
+        # `unsafe_pointer_to_objref` on a guessed address and printing
+        # may chase invalid interior pointers (observed: strlen
+        # SIGSEGV on a half-valid Symbol). The tag-derived type name
+        # is the only safe thing to render.
+        desc = obj === nothing ? "unidentified" :
+               "unsupported object of type $(typeof(obj))"
+        push!(log, string("0x", string(host_addr; base = 16), " — ", desc))
+    end
+    return
+end
 
-    T = eltype(vec)
-    n = length(vec)
-    elsz = Int(Base.aligned_sizeof(T))
+# The type-tag value (low GC bits masked) shared by every DataType
+# object. Used to validate that a candidate tag word actually points
+# at a DataType before we `unsafe_pointer_to_objref` a guessed address.
+const _DATATYPE_TAG = Ref{UInt}(0)
+
+# True when `v` is the type-tag idiom: `and(<load>, -16)` — codegen's
+# masked tag read (`obj[-8] & ~15`). Used to recognise switches /
+# integer compares whose constants are type identities.
+function is_type_tag_value(v)
+    v isa LLVM.Instruction || return false
+    LLVM.opcode(v) == LLVM.API.LLVMAnd || return false
+    ops = LLVM.operands(v)
+    for (c, other) in ((ops[1], ops[2]), (ops[2], ops[1]))
+        if c isa LLVM.ConstantInt && convert(Int64, c) == -16 &&
+           other isa LLVM.LoadInst
+            return true
+        end
+    end
+    return false
+end
+
+# Resolve an i64 tag constant (small typetag or host DataType address)
+# to the Julia DataType, or `nothing`.
+function resolve_tag_datatype(addr::Int)
+    if 0 < addr < 4096
+        return _small_typetag_to_datatype(addr)
+    end
+    addr % 8 == 0 || return nothing
+    obj = _identify_host_object(UInt(addr))
+    return obj isa DataType ? obj : nothing
+end
+
+# Same, but to the unified descriptor global (for pointer compares).
+function resolve_tag_constant!(mod::LLVM.Module, addr::Int)
+    dt = resolve_tag_datatype(addr)
+    dt === nothing && return nothing
+    return whisk_type_descriptor!(mod, dt)
+end
+
+"""
+    rewrite_tag_compare_constants!(mod) → Int
+
+Rewrite i64 type-identity constants in `switch`es and integer `icmp`s
+whose scrutinee is the masked-tag idiom. See the call site in
+`rewrite_host_pointer_constants!` for semantics.
+"""
+function rewrite_tag_compare_constants!(mod::LLVM.Module)
+    i64 = LLVM.Int64Type()
+    n = 0
+    for fn in LLVM.functions(mod)
+        LLVM.isdeclaration(fn) && continue
+        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            oc = LLVM.opcode(inst)
+            if oc == LLVM.API.LLVMSwitch
+                scrut = LLVM.operands(inst)[1]
+                is_type_tag_value(scrut) || continue
+                nops = LLVM.API.LLVMGetNumOperands(inst)
+                # operands: [cond, default_dest, val₁, dest₁, val₂, …].
+                # Switch case values must be LITERAL integers (a
+                # ptrtoint ConstantExpr is rejected by LLVM), so the
+                # transform keys the switch on the stable type id:
+                # scrutinee becomes `load i64 (tag + 16)` — the
+                # objectid header slot — and each resolvable case
+                # value becomes `objectid(T)`. Tag 0 (layout-0 allocs)
+                # reads wasm address 16 → 0 → default edge, which is
+                # also what host semantics give for an unknown type.
+                resolved = Tuple{Int, UInt64}[]
+                for i in 3:2:nops
+                    opref = LLVM.API.LLVMGetOperand(inst, i - 1)
+                    LLVM.API.LLVMGetValueKind(opref) ==
+                        LLVM.API.LLVMConstantIntValueKind || continue
+                    addr = convert(Int, LLVM.Value(opref))
+                    dt = resolve_tag_datatype(addr)
+                    dt === nothing && continue
+                    push!(resolved, (i, UInt64(objectid(dt))))
+                end
+                isempty(resolved) && continue
+                @dispose b = LLVM.IRBuilder() begin
+                    LLVM.position!(b, inst)
+                    oid_addr = LLVM.add!(b, scrut, LLVM.ConstantInt(i64, 16))
+                    oid_ptr  = LLVM.inttoptr!(b, oid_addr,
+                                               LLVM.PointerType(i64))
+                    oid      = LLVM.load!(b, i64, oid_ptr)
+                    LLVM.API.LLVMSetOperand(inst, 0, oid)
+                end
+                for (i, oid_val) in resolved
+                    LLVM.API.LLVMSetOperand(inst, i - 1,
+                        LLVM.ConstantInt(i64, reinterpret(Int64, oid_val)))
+                    n += 1
+                end
+            elseif oc == LLVM.API.LLVMICmp
+                ops = LLVM.operands(inst)
+                length(ops) == 2 || continue
+                for (a, b, idx) in ((ops[1], ops[2], 1), (ops[2], ops[1], 0))
+                    if b isa LLVM.ConstantInt && is_type_tag_value(a)
+                        addr = convert(Int, b)
+                        desc = resolve_tag_constant!(mod, addr)
+                        desc === nothing && continue
+                        LLVM.API.LLVMSetOperand(inst, idx,
+                            LLVM.const_ptrtoint(desc, i64))
+                        n += 1
+                    end
+                end
+            end
+        end
+    end
+    return n
+end
+
+# Resolve a small typetag value to the DataType in the host's
+# `jl_small_typeof` table. The tag is the BYTE OFFSET into the table
+# (verified empirically: a heap `String`'s tag is 0xa0 = 160 and
+# `jl_small_typeof[160 ÷ 8] === String`). Returns `nothing` for
+# empty / out-of-range slots.
+function _small_typetag_to_datatype(tag::Int)
+    tag % 8 == 0 || return nothing
+    idx = tag >> 3
+    0 <= idx < 256 || return nothing
+    base = cglobal(:jl_small_typeof, Ptr{Cvoid})
+    p = unsafe_load(Ptr{Ptr{Cvoid}}(base), idx + 1)
+    p == C_NULL && return nothing
+    obj = try
+        Base.unsafe_pointer_to_objref(p)
+    catch
+        return nothing
+    end
+    return obj isa DataType ? obj : nothing
+end
+
+# Crash-safe check that `[addr, addr+len)` is mapped readable memory.
+# `unsafe_load` on an unmapped address SIGSEGVs straight past Julia's
+# try/catch, so probe the pages via `mincore(2)` first: it returns 0
+# for mapped pages and -1/ENOMEM when any page in the range is
+# unmapped. (Linux-specific; the residency bytes are ignored — only
+# mapped-ness matters.)
+function _host_mem_readable(addr::UInt, len::UInt = UInt(8))
+    pagesz = UInt(ccall(:jl_getpagesize, Clong, ()))
+    first_page = addr & ~(pagesz - 1)
+    last_byte  = addr + len - 1
+    last_page  = last_byte & ~(pagesz - 1)
+    npages = Int((last_page - first_page) ÷ pagesz) + 1
+    vec = Vector{UInt8}(undef, npages)
+    ret = ccall(:mincore, Cint, (Ptr{Cvoid}, Csize_t, Ptr{Cvoid}),
+                Ptr{Cvoid}(first_page), Csize_t(npages * pagesz), vec)
+    return ret == 0
+end
+
+# Check whether `base` plausibly holds a Julia object, and return it.
+# Validation: the tag word at base-8 must either be a small typetag
+# (< 4096 — an index into jl_small_typeof, written only by the
+# runtime) or a pointer to a DataType whose OWN tag is the DataType
+# tag. Garbage rarely survives the two-level check. Every raw read is
+# preceded by a `mincore` mapped-ness probe so a garbage address can't
+# SIGSEGV the compiler. Returns `nothing` if validation fails.
+function _identify_host_object(base::UInt)
+    if _DATATYPE_TAG[] == 0
+        _DATATYPE_TAG[] =
+            unsafe_load(Ptr{UInt}(UInt(pointer_from_objref(Int64)) - 8)) & ~UInt(15)
+    end
+    _host_mem_readable(base - 8, UInt(16)) || return nothing
+    tag = unsafe_load(Ptr{UInt}(base - 8)) & ~UInt(15)
+    tag == 0 && return nothing
+    if tag >= 4096
+        tag % 16 == 0 || return nothing
+        _host_mem_readable(tag - 8) || return nothing
+        dt_tag = unsafe_load(Ptr{UInt}(tag - 8)) & ~UInt(15)
+        dt_tag == _DATATYPE_TAG[] || return nothing
+    end
+    return try
+        unsafe_pointer_to_objref(Ptr{Nothing}(base))
+    catch
+        nothing
+    end
+end
+
+# Snapshot a supported host object into a layout-faithful wasm global.
+# Returns `nothing` for unsupported types.
+function _materialize_host_object!(mod::LLVM.Module, @nospecialize(obj), base::Int)
+    if obj isa String
+        return _make_wasm_string_global!(mod, obj, base)
+    elseif obj isa Symbol
+        return _make_wasm_symbol_global!(mod, obj, base)
+    elseif obj isa DataType
+        return _make_wasm_datatype_global!(mod, obj)
+    elseif obj isa Memory
+        if isbitstype(eltype(obj))
+            return _make_wasm_memory_global!(mod, obj, base)
+        elseif !Base.allocatedinline(eltype(obj))
+            # Reference elements (Memory{Symbol}, Memory{Any}, …):
+            # recursive object-graph serialization, slot per element.
+            return _make_wasm_memory_boxed_global!(mod, obj, base)
+        end
+        # Inline-stored non-bits elements (struct-with-refs): needs the
+        # full image builder (task: static data image). Falls through
+        # to the fallback log.
+        return nothing
+    elseif obj isa Vector
+        return _make_wasm_vector_global!(mod, obj, base)
+    elseif isbits(obj)
+        return _make_wasm_boxed_bits_global!(mod, obj, base)
+    end
+    return nothing
+end
+
+"""
+Build a wasm global for a `Memory{T}` with REFERENCE elements (boxed
+slots — `Memory{Symbol}`, `Memory{Any}`, …). Same object layout as the
+bits variant ({tag, len, data_ptr, slots}, object base at +8), but
+each 8-byte slot holds the address of a recursively materialised
+element. Unassigned slots and elements the materialiser doesn't
+support yet become null (loads of those slots null-check or trap
+loudly downstream — never silently alias).
+
+The global is created and name-registered BEFORE recursing into
+elements, so self-referential object graphs terminate.
+"""
+function _make_wasm_memory_boxed_global!(mod::LLVM.Module, mem::Memory, host_addr::Int)
+    i8  = LLVM.Int8Type()
+    i64 = LLVM.Int64Type()
+    gname = "_whisk_mem_$(host_addr)"
+    if haskey(LLVM.globals(mod), gname)
+        return LLVM.const_inbounds_gep(i8, LLVM.globals(mod)[gname],
+            [LLVM.ConstantInt(i64, 8)])
+    end
+
+    n = length(mem)
+    slots_ty = LLVM.ArrayType(i64, n)
+    # {tag, len, data_ptr, slots} — object base +8 gives the Memory's
+    # own layout {len@0, ptr@8, data@16}.
+    struct_ty = LLVM.StructType([i64, i64, LLVM.PointerType(i8), slots_ty])
+    gv = LLVM.GlobalVariable(mod, struct_ty, gname)   # registered pre-recursion
+
+    slot_consts = Vector{LLVM.Constant}(undef, n)
+    for i in 1:n
+        if isassigned(mem, i)
+            # Raw slot pointer — the element's canonical host address
+            # (mem[i] would unbox isbits values and lose the box key).
+            praw = GC.@preserve mem unsafe_load(
+                Ptr{UInt}(Base.unsafe_convert(Ptr{eltype(mem)}, mem)), i)
+            el_const = if praw == 0
+                nothing
+            else
+                el = _identify_host_object(praw)
+                el === nothing ? nothing :
+                    _materialize_host_object!(mod, el, Int(praw))
+            end
+            if el_const === nothing
+                praw != 0 && _record_reconstruct_fallback!(mod, Int(praw),
+                    _identify_host_object(praw))
+                slot_consts[i] = LLVM.ConstantInt(i64, 0)
+            else
+                slot_consts[i] = LLVM.const_ptrtoint(el_const, i64)
+            end
+        else
+            slot_consts[i] = LLVM.ConstantInt(i64, 0)
+        end
+    end
+
+    tag_gv = whisk_type_descriptor!(mod, typeof(mem))
+    data_ptr = LLVM.const_inbounds_gep(i8, gv, [LLVM.ConstantInt(i64, 24)])
+    slots_init = n == 0 ? LLVM.null(slots_ty) : LLVM.ConstantArray(i64, slot_consts)
+    LLVM.initializer!(gv, LLVM.ConstantStruct(struct_ty, LLVM.Constant[
+        LLVM.const_ptrtoint(tag_gv, i64),
+        LLVM.ConstantInt(i64, n), data_ptr, slots_init]))
+    LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
+    LLVM.constant!(gv, true)
+    LLVM.alignment!(gv, 16)
+
+    return LLVM.const_inbounds_gep(i8, gv, [LLVM.ConstantInt(i64, 8)])
+end
+
+"""
+Build a wasm global for a **boxed** isbits host object (a const-folded
+literal that codegen references through a heap box — e.g. `2.0f0`
+pushed into a `Vector{Any}`). Layout mirrors Julia's box exactly:
+
+    offset 0: i64 type tag  (ptrtoint of the DataType descriptor)
+    offset 8: payload bytes
+
+Julia object pointers point at the PAYLOAD with the tag at −8, so the
+returned constant is a const-GEP at +8 — type checks that load
+`obj[-8]`, mask, and compare against the descriptor global succeed.
+"""
+function _make_wasm_boxed_bits_global!(mod::LLVM.Module, @nospecialize(obj), host_addr::Int)
+    # Dedup BY NAME — cached LLVM handles dangle across GPUCompiler's
+    # global-cloning passes (names survive). The returned constant is
+    # rebuilt cheaply on every hit.
+    gname = "_whisk_box_$(host_addr)"
+    if haskey(LLVM.globals(mod), gname)
+        return LLVM.const_inbounds_gep(LLVM.Int8Type(), LLVM.globals(mod)[gname],
+            [LLVM.ConstantInt(LLVM.Int64Type(), 8)])
+    end
+
+    T = typeof(obj)
+    tag_gv = _make_wasm_datatype_global!(mod, T)
+    sz = sizeof(T)
+    bytes = Vector{UInt8}(undef, sz)
+    if sz > 0
+        ref = Ref(obj)
+        GC.@preserve ref bytes begin
+            ccall(:memcpy, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
+                  pointer(bytes), Base.unsafe_convert(Ptr{Cvoid}, Base.unsafe_convert(Ptr{T}, ref)),
+                  Csize_t(sz))
+        end
+    end
+
+    i8  = LLVM.Int8Type()
+    i64 = LLVM.Int64Type()
+    payload_ty = LLVM.ArrayType(i8, sz)
+    struct_ty = LLVM.StructType([i64, payload_ty])
+    payload_init = sz == 0 ? LLVM.null(payload_ty) :
+        LLVM.ConstantArray(i8, [LLVM.ConstantInt(i8, Int(b)) for b in bytes])
+    gv = LLVM.GlobalVariable(mod, struct_ty, gname)
+    LLVM.initializer!(gv, LLVM.ConstantStruct(struct_ty, LLVM.Constant[
+        LLVM.const_ptrtoint(tag_gv, i64), payload_init]))
+    LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
+    LLVM.constant!(gv, true)
+    LLVM.alignment!(gv, 16)
+
+    return LLVM.const_inbounds_gep(i8, gv, [LLVM.ConstantInt(i64, 8)])
+end
+
+# The wasm-side type identity for `dt` — every path converges on the
+# unified per-type descriptor (see `whisk_type_descriptor!` in
+# runtime/layout.jl): isa/typeassert compare sites, box type tags,
+# `whisk_gc_alloc_typed` headers, and runtime field access.
+_make_wasm_datatype_global!(mod::LLVM.Module, dt::DataType) =
+    whisk_type_descriptor!(mod, dt)
+
+"""
+Build a wasm global mirroring Julia's `Memory{T}` runtime layout for
+bitstype `T`, with the data INLINE — exactly like the host's
+small-Memory layout:
+
+    offset 0:  i64 length            (element count, not bytes)
+    offset 8:  ptr data              (points at offset 16 of this global)
+    offset 16: [nbytes x i8] data
+
+The self-referential data pointer is a const-GEP into the global
+itself, which the linker resolves. Because the layout matches the
+host object byte-for-byte, interior pointers (`M+8` for the data-ptr
+field, `M+16` for inline data) map to the same offsets here.
+"""
+function _make_wasm_memory_global!(mod::LLVM.Module, mem::Memory, host_addr::Int)
+    i8  = LLVM.Int8Type()
+    i64 = LLVM.Int64Type()
+    gname = "_whisk_mem_$(host_addr)"
+    if haskey(LLVM.globals(mod), gname)
+        return LLVM.const_inbounds_gep(i8, LLVM.globals(mod)[gname],
+            [LLVM.ConstantInt(i64, 8)])
+    end
+
+    T = eltype(mem)
+    n = length(mem)
+    elsz = Base.elsize(typeof(mem))
     nbytes = n * elsz
 
-    # 1) Raw data bytes (the Memory's inline payload).
-    data_arr_ty = LLVM.ArrayType(LLVM.Int8Type(), nbytes)
-    data_init   = if nbytes == 0
+    tag_gv = whisk_type_descriptor!(mod, typeof(mem))
+    data_arr_ty = LLVM.ArrayType(i8, nbytes)
+    # {tag, len, data_ptr, bytes} — object base is +8, so the Memory's
+    # own layout {len@0, ptr@8, inline data@16} holds relative to it.
+    struct_ty = LLVM.StructType([i64, i64, LLVM.PointerType(i8), data_arr_ty])
+    gv = LLVM.GlobalVariable(mod, struct_ty, gname)
+
+    data_init = if nbytes == 0
         LLVM.null(data_arr_ty)
     else
-        raw = unsafe_wrap(Array, Ptr{UInt8}(Base.unsafe_convert(Ptr{T}, vec)),
-                          nbytes; own = false)
-        LLVM.ConstantArray(LLVM.Int8Type(),
-            [LLVM.ConstantInt(LLVM.Int8Type(), Int(b)) for b in raw])
+        bytes = Vector{UInt8}(undef, nbytes)
+        GC.@preserve mem bytes begin
+            ccall(:memcpy, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
+                  pointer(bytes), Base.unsafe_convert(Ptr{T}, mem), Csize_t(nbytes))
+        end
+        LLVM.ConstantArray(i8,
+            [LLVM.ConstantInt(i8, Int(b)) for b in bytes])
     end
-    data_gv = LLVM.GlobalVariable(mod, data_arr_ty, "_whisk_vec_data_$(host_addr)")
-    LLVM.initializer!(data_gv, data_init)
-    LLVM.linkage!(data_gv, LLVM.API.LLVMInternalLinkage)
-    LLVM.constant!(data_gv, true)
-
-    # 2) Memory{T} struct (length + data ptr) so any path that loads
-    # `vec.ref.mem` and dereferences finds a valid Memory.
-    mem_struct_ty = LLVM.StructType([LLVM.Int64Type(), LLVM.PointerType(LLVM.Int8Type())])
-    mem_init = LLVM.ConstantStruct(mem_struct_ty,
-        LLVM.Constant[LLVM.ConstantInt(LLVM.Int64Type(), n), data_gv])
-    mem_gv = LLVM.GlobalVariable(mod, mem_struct_ty, "_whisk_vec_mem_$(host_addr)")
-    LLVM.initializer!(mem_gv, mem_init)
-    LLVM.linkage!(mem_gv, LLVM.API.LLVMInternalLinkage)
-    LLVM.constant!(mem_gv, true)
-
-    # 3) Vector struct: {data_ptr, mem_ptr, length}. IR will:
-    #     * load data_ptr at +0 for `arr[i]` reads
-    #     * load length  at +16 for the bounds check
-    #     * load mem_ptr at +8  if any path needs the Memory directly
-    vec_struct_ty = LLVM.StructType([
-        LLVM.PointerType(LLVM.Int8Type()),   # ptr_or_offset (data)
-        LLVM.PointerType(LLVM.Int8Type()),   # mem
-        LLVM.Int64Type(),                    # size
-    ])
-    vec_init = LLVM.ConstantStruct(vec_struct_ty,
-        LLVM.Constant[data_gv, mem_gv, LLVM.ConstantInt(LLVM.Int64Type(), n)])
-    vec_gv = LLVM.GlobalVariable(mod, vec_struct_ty, "_whisk_vec_$(host_addr)")
-    LLVM.initializer!(vec_gv, vec_init)
-    LLVM.linkage!(vec_gv, LLVM.API.LLVMInternalLinkage)
-    LLVM.constant!(vec_gv, true)
-
-    cache[host_addr] = vec_gv
-    return vec_gv
-end
-
-function _make_wasm_memory_u8_global!(mod::LLVM.Module, bytes, host_addr::Int)
-    cache = get!(() -> Dict{Int, Any}(), _WASM_MEMORY_GLOBAL_CACHE, mod)
-    haskey(cache, host_addr) && return cache[host_addr]
-
-    nbytes = length(bytes)
-    # Layout: [u64 length][u64 placeholder for data ptr][bytes...]
-    # (We can't put the real data ptr in an LLVM constant initializer
-    #  — its value depends on the global's own address, which the
-    #  linker resolves. Instead we keep the data inline immediately
-    #  after the struct and emit a getelementptr at runtime to derive
-    #  the data ptr. That requires Julia's IR to know the layout
-    #  though, and it doesn't — it expects {length, data_ptr} where
-    #  data_ptr is a real pointer to bytes.)
-    #
-    # Workaround: emit *two* separate globals, one for the data bytes
-    # and one for the struct. The struct's `data` field is initialised
-    # via an LLVM ConstantExpr that ptrtoint's the data global into i64.
-
-    data_arr_ty = LLVM.ArrayType(LLVM.Int8Type(), nbytes)
-    data_init   = if nbytes == 0
-        LLVM.null(data_arr_ty)
-    else
-        LLVM.ConstantArray(LLVM.Int8Type(),
-                           [LLVM.ConstantInt(LLVM.Int8Type(), Int(b)) for b in bytes])
-    end
-    data_gv = LLVM.GlobalVariable(mod, data_arr_ty,
-                                   "_whisk_data_$(host_addr)")
-    LLVM.initializer!(data_gv, data_init)
-    LLVM.linkage!(data_gv, LLVM.API.LLVMInternalLinkage)
-    LLVM.constant!(data_gv, true)
-
-    # Struct: { i64 length, ptr data }. We need an LLVM struct type
-    # matching what Julia's IR expects.
-    struct_ty = LLVM.StructType([LLVM.Int64Type(), LLVM.PointerType(LLVM.Int8Type())])
-    length_const = LLVM.ConstantInt(LLVM.Int64Type(), nbytes)
-    data_ptr_const = data_gv  # pointer constant
-    struct_init = LLVM.ConstantStruct(struct_ty, LLVM.Constant[length_const, data_ptr_const])
-
-    struct_gv = LLVM.GlobalVariable(mod, struct_ty,
-                                     "_whisk_mem_$(host_addr)")
-    LLVM.initializer!(struct_gv, struct_init)
-    LLVM.linkage!(struct_gv, LLVM.API.LLVMInternalLinkage)
-    LLVM.constant!(struct_gv, true)
-
-    cache[host_addr] = struct_gv
-    return struct_gv
-end
-
-"""
-Build a wasm global mirroring Julia's `String` runtime layout. Julia
-accesses string bytes via `gep i8, host_addr, i64 8` (where `host_addr`
-is the String object) then `+i-1`. We emit a flat byte array of
-length `8 + length(bytes)`: the first 8 bytes are dummy header, the
-remainder are the actual codeunits.
-"""
-function _make_wasm_string_global!(mod::LLVM.Module, bytes, host_addr::Int)
-    cache = get!(() -> Dict{Int, Any}(), _WASM_MEMORY_GLOBAL_CACHE, mod)
-    haskey(cache, host_addr) && return cache[host_addr]
-
-    nbytes = length(bytes)
-    total = 8 + nbytes
-    ty = LLVM.ArrayType(LLVM.Int8Type(), total)
-
-    consts = Vector{LLVM.Constant}(undef, total)
-    for i in 1:8
-        consts[i] = LLVM.ConstantInt(LLVM.Int8Type(), 0)
-    end
-    for (j, b) in enumerate(bytes)
-        consts[8 + j] = LLVM.ConstantInt(LLVM.Int8Type(), Int(b))
-    end
-    init = LLVM.ConstantArray(LLVM.Int8Type(), consts)
-
-    gv = LLVM.GlobalVariable(mod, ty, "_whisk_str_$(host_addr)")
+    data_ptr = LLVM.const_inbounds_gep(i8, gv, [LLVM.ConstantInt(i64, 24)])
+    init = LLVM.ConstantStruct(struct_ty, LLVM.Constant[
+        LLVM.const_ptrtoint(tag_gv, i64),
+        LLVM.ConstantInt(i64, n), data_ptr, data_init])
     LLVM.initializer!(gv, init)
     LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
     LLVM.constant!(gv, true)
+    LLVM.alignment!(gv, 16)
 
-    cache[host_addr] = gv
-    return gv
+    return LLVM.const_inbounds_gep(i8, gv, [LLVM.ConstantInt(i64, 8)])
+end
+
+"""
+Build a wasm global mirroring Julia's `Vector{T}` runtime layout for
+bitstype `T`: `{ptr data, ptr mem, i64 length}`. The backing `Memory`
+is materialised via `_make_wasm_memory_global!` (keyed by ITS host
+address, so a Memory shared by several vectors is emitted once), and
+the data pointer is a const-GEP into that global at the same byte
+offset the host vector's `ref.ptr_or_offset` has into its Memory.
+"""
+function _make_wasm_vector_global!(mod::LLVM.Module, vec::Vector, host_addr::Int)
+    i8  = LLVM.Int8Type()
+    i64 = LLVM.Int64Type()
+    gname = "_whisk_vec_$(host_addr)"
+    if haskey(LLVM.globals(mod), gname)
+        return LLVM.const_inbounds_gep(i8, LLVM.globals(mod)[gname],
+            [LLVM.ConstantInt(i64, 8)])
+    end
+
+    T = eltype(vec)
+    mem = getfield(vec, :ref).mem
+    mem_addr = Int(UInt(pointer_from_objref(mem)))
+    mem_base = if isbitstype(T)
+        _make_wasm_memory_global!(mod, mem, mem_addr)
+    elseif !Base.allocatedinline(T)
+        _make_wasm_memory_boxed_global!(mod, mem, mem_addr)
+    else
+        return nothing   # inline struct-with-refs elements: needs the image builder
+    end
+    # mem_base is the OBJECT-base constant (gep +8 into the tagged global).
+
+    # Byte offset of the vector's first element within the Memory data
+    # (data starts at mem object base + 16).
+    doff = UInt(pointer(vec)) - UInt(Base.unsafe_convert(Ptr{T}, mem))
+    data_ptr = LLVM.const_inbounds_gep(i8, mem_base,
+        [LLVM.ConstantInt(i64, 16 + Int(doff))])
+
+    tag_gv = whisk_type_descriptor!(mod, typeof(vec))
+    vec_struct_ty = LLVM.StructType([
+        i64,                    # type tag (obj[-8])
+        LLVM.PointerType(i8),   # ref.ptr_or_offset (data)
+        LLVM.PointerType(i8),   # ref.mem
+        i64,                    # size
+    ])
+    vec_init = LLVM.ConstantStruct(vec_struct_ty, LLVM.Constant[
+        LLVM.const_ptrtoint(tag_gv, i64),
+        data_ptr, mem_base, LLVM.ConstantInt(i64, length(vec))])
+    vec_gv = LLVM.GlobalVariable(mod, vec_struct_ty, gname)
+    LLVM.initializer!(vec_gv, vec_init)
+    LLVM.linkage!(vec_gv, LLVM.API.LLVMInternalLinkage)
+    LLVM.constant!(vec_gv, true)
+    LLVM.alignment!(vec_gv, 16)
+
+    return LLVM.const_inbounds_gep(i8, vec_gv, [LLVM.ConstantInt(i64, 8)])
+end
+
+"""
+Build a wasm global mirroring Julia's `jl_sym_t` runtime layout
+(verified empirically on 1.12):
+
+    offset 0:  ptr left      (intern-tree child — null in wasm)
+    offset 8:  ptr right     (intern-tree child — null in wasm)
+    offset 16: i64 hash      (== `objectid(sym)` / `hash(sym)` on the host)
+    offset 24: name bytes + NUL
+
+Symbol identity (`===`) keeps working because every unique host Symbol
+address maps to exactly one wasm global (the per-module cache), and
+`hash(::Symbol)` paths that read the precomputed `hash` field at +16
+see the host value — consistent with hashes that inference already
+const-folded into the code.
+"""
+function _make_wasm_symbol_global!(mod::LLVM.Module, sym::Symbol, host_addr::Int)
+    gname = "_whisk_sym_$(String(sym))_$(host_addr)"
+    if haskey(LLVM.globals(mod), gname)
+        return LLVM.const_inbounds_gep(LLVM.Int8Type(), LLVM.globals(mod)[gname],
+            [LLVM.ConstantInt(LLVM.Int64Type(), 8)])
+    end
+
+    name_bytes = codeunits(String(sym))
+    n = length(name_bytes)
+    i8  = LLVM.Int8Type()
+    i64 = LLVM.Int64Type()
+    tag_gv = whisk_type_descriptor!(mod, Symbol)
+    name_arr_ty = LLVM.ArrayType(i8, n + 1)
+    struct_ty = LLVM.StructType([i64, LLVM.PointerType(i8), LLVM.PointerType(i8),
+                                 i64, name_arr_ty])  # {tag, left, right, hash, name}
+
+    name_consts = Vector{LLVM.Constant}(undef, n + 1)
+    for (j, b) in enumerate(name_bytes)
+        name_consts[j] = LLVM.ConstantInt(i8, Int(b))
+    end
+    name_consts[n + 1] = LLVM.ConstantInt(i8, 0)
+
+    init = LLVM.ConstantStruct(struct_ty, LLVM.Constant[
+        LLVM.const_ptrtoint(tag_gv, i64),
+        LLVM.null(LLVM.PointerType(i8)),
+        LLVM.null(LLVM.PointerType(i8)),
+        LLVM.ConstantInt(i64, reinterpret(Int64, UInt64(hash(sym)))),
+        LLVM.ConstantArray(i8, name_consts),
+    ])
+    gv = LLVM.GlobalVariable(mod, struct_ty, gname)
+    LLVM.initializer!(gv, init)
+    LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
+    LLVM.constant!(gv, true)
+    LLVM.alignment!(gv, 16)
+
+    return LLVM.const_inbounds_gep(i8, gv, [LLVM.ConstantInt(i64, 8)])
+end
+
+"""
+Build a wasm global mirroring Julia's `String` runtime layout:
+
+    offset 0: i64 length     (real codeunit count — `sizeof(s)` works)
+    offset 8: bytes…         (the codeunits, plus a trailing NUL like
+                              the host runtime appends)
+
+Because the layout is faithful, both object-pointer references (gep
++8 in the IR finds the data) and baked data pointers (`S+8`, replaced
+by a const-GEP at offset 8) read the right bytes.
+"""
+function _make_wasm_string_global!(mod::LLVM.Module, s::String, host_addr::Int)
+    i8  = LLVM.Int8Type()
+    i64 = LLVM.Int64Type()
+    gname = "_whisk_str_$(host_addr)"
+    if haskey(LLVM.globals(mod), gname)
+        return LLVM.const_inbounds_gep(i8, LLVM.globals(mod)[gname],
+            [LLVM.ConstantInt(i64, 8)])
+    end
+
+    bytes = codeunits(s)
+    nbytes = length(bytes)
+    tag_gv = whisk_type_descriptor!(mod, String)
+    data_ty = LLVM.ArrayType(i8, nbytes + 1)   # data + trailing NUL
+    struct_ty = LLVM.StructType([i64, i64, data_ty])  # {tag, len, bytes}
+
+    consts = Vector{LLVM.Constant}(undef, nbytes + 1)
+    for (j, b) in enumerate(bytes)
+        consts[j] = LLVM.ConstantInt(i8, Int(b))
+    end
+    consts[nbytes + 1] = LLVM.ConstantInt(i8, 0)
+
+    gv = LLVM.GlobalVariable(mod, struct_ty, gname)
+    LLVM.initializer!(gv, LLVM.ConstantStruct(struct_ty, LLVM.Constant[
+        LLVM.const_ptrtoint(tag_gv, i64),
+        LLVM.ConstantInt(i64, nbytes),
+        LLVM.ConstantArray(i8, consts),
+    ]))
+    LLVM.linkage!(gv, LLVM.API.LLVMInternalLinkage)
+    LLVM.constant!(gv, true)
+    LLVM.alignment!(gv, 16)
+
+    # Object pointer = +8 (tag word sits at obj[-8], Julia layout).
+    return LLVM.const_inbounds_gep(i8, gv, [LLVM.ConstantInt(i64, 8)])
 end
 
 """

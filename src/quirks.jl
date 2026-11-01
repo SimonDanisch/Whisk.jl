@@ -9,3 +9,19 @@
 
 using Base.Experimental: @overlay, @MethodTable
 @MethodTable method_table
+
+# ── Threads.Atomic ops — wasm builds are single-threaded, so the
+# host's lock-based / LLVM-atomicrmw paths degrade to plain field
+# updates. Without these overlays every `atomic_*` call on a global
+# counter (e.g. Observables' OBSID_COUNTER) becomes an unresolvable
+# dynamic site through host-runtime atomics.
+@overlay method_table function Base.Threads.atomic_add!(x::Base.Threads.Atomic{T}, v::T) where {T}
+    old = x[]
+    x[] = old + v
+    return old
+end
+@overlay method_table function Base.Threads.atomic_sub!(x::Base.Threads.Atomic{T}, v::T) where {T}
+    old = x[]
+    x[] = old - v
+    return old
+end

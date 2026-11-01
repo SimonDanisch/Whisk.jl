@@ -91,64 +91,123 @@ end
 ## The returned pointer points at the value; the type tag lives at
 ## offset −8 (Julia's standard heap-object layout). Our wasm runtime
 ## doesn't use the host's GC tracking — boxes live on our own linear-
-## memory heap (allocated by `whisk_gc_alloc`). The type tag is
-## currently a zero placeholder; it will become a real type id when we
-## need to differentiate boxes for dynamic dispatch (Step 4 of the
-## next-phase plan).
+## memory heap (allocated by `whisk_gc_alloc`). The type tag is the
+## linked address of the wasm-side DataType descriptor global
+## (`whisk_typetag_<T>` extern, defined by `define_box_typetags!`), so
+## `typeof` / `isa` / typeassert tag compares work on box values.
 
-# Direct LLVM call to `whisk_gc_alloc`. Goes via `llvmcall` rather than
-# `ccall` because these helpers sub-compile with `toplevel = false` and
-# Julia would otherwise route a bare-symbol ccall through
-# `ijl_load_and_lookup` (the runtime symbol-resolution path), which
-# can't run in our wasm module. `llvmcall` emits a direct
-# `call @whisk_gc_alloc(i64 ...)` that resolves at link time against
-# the parent module's allocator definition.
+# `ccall("extern <sym>", llvmcall, …)` is the GPUCompiler-idiomatic way
+# to emit a direct `call @whisk_gc_alloc(i64 …)` that resolves at link
+# time. The `Base.llvmcall((decl, body), …)` tuple form is NOT safe
+# here: under the GPUCompiler interpreter the tuple argument doesn't
+# const-fold into the intrinsic, and Julia's codegen then silently
+# emits `jl_error("llvmcall requires a constant")` — which Whisk's
+# throw lowering turns into an unconditional trap, replacing the
+# allocator body with `unreachable` (bit us via every `ijl_box_*`).
 @inline function _whisk_gc_alloc(sz::UInt64)::UInt64
-    Base.llvmcall(
-        ("declare i64 @whisk_gc_alloc(i64)",
-         """
-         %r = call i64 @whisk_gc_alloc(i64 %0)
-         ret i64 %r
-         """),
-        UInt64, Tuple{UInt64}, sz)
+    ccall("extern whisk_gc_alloc", llvmcall, UInt64, (UInt64,), sz)
 end
 
-# Allocate a Julia-style box: 8-byte type tag header + payload bytes.
-# Returns the address of the payload (so caller sees `box[-8]` = tag,
-# `box[0..]` = value), matching Julia's heap layout.
+# Allocate a Julia-style box. With unified type descriptors the GC
+# header's layout word at `payload[-8]` IS the Julia type tag
+# (`whisk_gc_alloc_typed` stores it there), so no extra tag word is
+# needed — and boxes whose payload contains heap references are
+# scanned precisely per the descriptor's layout prefix.
 @inline function _whisk_alloc_box(payload_size::UInt64, type_tag::UInt64)::UInt64
-    base = _whisk_gc_alloc(payload_size + UInt64(8))
-    unsafe_store!(Ptr{UInt64}(base), type_tag, 1)
-    return base + UInt64(8)
+    ccall("extern whisk_gc_alloc_typed", llvmcall, UInt64, (UInt64, UInt64),
+          payload_size, type_tag)
 end
+
+# Per-type tag accessors. Each emits `call i64 @whisk_typetag_<T>()` —
+# an extern the compile pipeline defines after linking (see
+# `define_box_typetags!` in compiler/host_globals.jl): it returns the
+# linked address of the wasm-side DataType descriptor global for `T`,
+# the SAME global that `rewrite_host_pointer_constants!` substitutes
+# for baked host `DataType` pointers at `isa`/typeassert compare sites.
+# Boxes tagged this way therefore pass runtime type checks.
+@inline _whisk_typetag_Int64()   = ccall("extern whisk_typetag_Int64",   llvmcall, UInt64, ())
+@inline _whisk_typetag_Int32()   = ccall("extern whisk_typetag_Int32",   llvmcall, UInt64, ())
+@inline _whisk_typetag_Int16()   = ccall("extern whisk_typetag_Int16",   llvmcall, UInt64, ())
+@inline _whisk_typetag_Int8()    = ccall("extern whisk_typetag_Int8",    llvmcall, UInt64, ())
+@inline _whisk_typetag_UInt8()   = ccall("extern whisk_typetag_UInt8",   llvmcall, UInt64, ())
+@inline _whisk_typetag_UInt16()  = ccall("extern whisk_typetag_UInt16",  llvmcall, UInt64, ())
+@inline _whisk_typetag_UInt32()  = ccall("extern whisk_typetag_UInt32",  llvmcall, UInt64, ())
+@inline _whisk_typetag_UInt64()  = ccall("extern whisk_typetag_UInt64",  llvmcall, UInt64, ())
+@inline _whisk_typetag_Float64() = ccall("extern whisk_typetag_Float64", llvmcall, UInt64, ())
+@inline _whisk_typetag_Float32() = ccall("extern whisk_typetag_Float32", llvmcall, UInt64, ())
+@inline _whisk_typetag_Char()    = ccall("extern whisk_typetag_Char",    llvmcall, UInt64, ())
+@inline _whisk_typetag_Bool()    = ccall("extern whisk_typetag_Bool",    llvmcall, UInt64, ())
 
 function whisk_jl_box_int64(v::Int64)::Ptr{Cvoid}
-    addr = _whisk_alloc_box(UInt64(8), UInt64(0))
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Int64())
     unsafe_store!(Ptr{Int64}(addr), v, 1)
     return Ptr{Cvoid}(addr)
 end
 
 function whisk_jl_box_uint64(v::UInt64)::Ptr{Cvoid}
-    addr = _whisk_alloc_box(UInt64(8), UInt64(0))
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_UInt64())
     unsafe_store!(Ptr{UInt64}(addr), v, 1)
     return Ptr{Cvoid}(addr)
 end
 
 function whisk_jl_box_int32(v::Int32)::Ptr{Cvoid}
-    addr = _whisk_alloc_box(UInt64(8), UInt64(0))
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Int32())
     unsafe_store!(Ptr{Int32}(addr), v, 1)
     return Ptr{Cvoid}(addr)
 end
 
 function whisk_jl_box_uint8(v::UInt8)::Ptr{Cvoid}
-    addr = _whisk_alloc_box(UInt64(8), UInt64(0))
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_UInt8())
     unsafe_store!(Ptr{UInt8}(addr), v, 1)
     return Ptr{Cvoid}(addr)
 end
 
 function whisk_jl_box_float64(v::Float64)::Ptr{Cvoid}
-    addr = _whisk_alloc_box(UInt64(8), UInt64(0))
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Float64())
     unsafe_store!(Ptr{Float64}(addr), v, 1)
+    return Ptr{Cvoid}(addr)
+end
+
+function whisk_jl_box_float32(v::Float32)::Ptr{Cvoid}
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Float32())
+    unsafe_store!(Ptr{Float32}(addr), v, 1)
+    return Ptr{Cvoid}(addr)
+end
+
+function whisk_jl_box_int8(v::Int8)::Ptr{Cvoid}
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Int8())
+    unsafe_store!(Ptr{Int8}(addr), v, 1)
+    return Ptr{Cvoid}(addr)
+end
+
+function whisk_jl_box_int16(v::Int16)::Ptr{Cvoid}
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Int16())
+    unsafe_store!(Ptr{Int16}(addr), v, 1)
+    return Ptr{Cvoid}(addr)
+end
+
+function whisk_jl_box_uint16(v::UInt16)::Ptr{Cvoid}
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_UInt16())
+    unsafe_store!(Ptr{UInt16}(addr), v, 1)
+    return Ptr{Cvoid}(addr)
+end
+
+function whisk_jl_box_uint32(v::UInt32)::Ptr{Cvoid}
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_UInt32())
+    unsafe_store!(Ptr{UInt32}(addr), v, 1)
+    return Ptr{Cvoid}(addr)
+end
+
+# `jl_box_char` takes the char's UTF-32 codepoint payload as uint32.
+function whisk_jl_box_char(v::UInt32)::Ptr{Cvoid}
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Char())
+    unsafe_store!(Ptr{UInt32}(addr), v, 1)
+    return Ptr{Cvoid}(addr)
+end
+
+function whisk_jl_box_bool(v::Int8)::Ptr{Cvoid}
+    addr = _whisk_alloc_box(UInt64(8), _whisk_typetag_Bool())
+    unsafe_store!(Ptr{Int8}(addr), v, 1)
     return Ptr{Cvoid}(addr)
 end
 
@@ -211,6 +270,96 @@ function whisk_ensure_capacity(end_addr::UInt64)::Nothing
     return nothing
 end
 
+## ─────────────────────────────────────────────────────────────────────
+## Runtime field access (`ijl_get_nth_field_checked`)
+## ─────────────────────────────────────────────────────────────────────
+##
+## Julia emits `call ptr @ijl_get_nth_field_checked(ptr v, i64 i)` when
+## it needs `getfield(v, i)` on a value whose type it only knows at
+## runtime (e.g. iterating a heterogeneous vararg tuple in
+## `print_to_string`). We walk the unified type descriptor that
+## `obj[-8] & ~15` points at (see runtime/layout.jl for the wire
+## format): pointer fields load the slot; inline fields are re-boxed
+## with the field's own descriptor as the tag.
+
+# Runtime-helper error channel. `ccall("extern js_console", llvmcall,…)`
+# rather than `ccall(:js_console, …)` — in sub-jobs (toplevel=false) the
+# bare-symbol form lowers to an `ijl_load_and_lookup` PLT thunk that
+# wasm can't run; the extern form emits a direct call against the
+# js_console import. The `llvm.trap` intrinsic ccall is the
+# sub-job-safe halt (same pattern as `whisk_memory_size_pages`).
+@noinline function _whisk_rt_error(msg::String)::Nothing
+    GC.@preserve msg ccall("extern js_console", llvmcall, Cvoid,
+                           (Int32, Ptr{UInt8}, UInt64),
+                           Int32(2), pointer(msg), UInt64(sizeof(msg)))
+    ccall("llvm.trap", llvmcall, Cvoid, ())
+    return nothing
+end
+
+# `jl_f_tuple` lowering target: plain Julia, sub-compiled per arity at
+# the call site (`lower_julia_call_builtins!`). The tuple construction,
+# boxing and type tagging all go through the normal compile pipeline —
+# no hand-emitted IR. `inferencebarrier` forces the `Any` (boxed-ptr)
+# return ABI the `julia.call` site expects.
+@noinline whisk_rt_tuple(args...) = Base.inferencebarrier(args)
+
+function whisk_jl_get_nth_field_checked(v::Ptr{Cvoid}, i::UInt64)::Ptr{Cvoid}
+    a = UInt64(reinterpret(UInt, v))
+    desc = unsafe_load(Ptr{UInt64}(a - UInt64(8))) & ~UInt64(15)
+    if desc == 0
+        _whisk_rt_error("getfield: object carries no type descriptor (layout=0 allocation)")
+        return Ptr{Cvoid}(0)
+    end
+    nptrs = unsafe_load(Ptr{UInt64}(desc + UInt64(8)))
+    # Header: {elsz, nptrs, objectid, offsets[nptrs]} — meta follows.
+    meta = desc + UInt64(24) + (nptrs << 3)
+    nf = unsafe_load(Ptr{UInt64}(meta + UInt64(8)))
+    if i >= nf
+        _whisk_rt_error("getfield: field index out of bounds")
+        return Ptr{Cvoid}(0)
+    end
+    fields = desc + unsafe_load(Ptr{UInt64}(meta + UInt64(16)))
+    rec   = fields + i * UInt64(24)
+    off   = unsafe_load(Ptr{UInt64}(rec))
+    fdesc = unsafe_load(Ptr{UInt64}(rec + UInt64(8)))
+    kind  = unsafe_load(Ptr{UInt64}(rec + UInt64(16)))
+    if kind == UInt64(0)
+        return Ptr{Cvoid}(unsafe_load(Ptr{UInt64}(a + off)))
+    elseif kind == UInt64(1)
+        fnptrs = unsafe_load(Ptr{UInt64}(fdesc + UInt64(8)))
+        fmeta  = fdesc + UInt64(24) + (fnptrs << 3)
+        sz     = unsafe_load(Ptr{UInt64}(fmeta))
+        box = _whisk_alloc_box(sz, fdesc)
+        ccall(:memcpy, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
+              Ptr{Cvoid}(box), Ptr{Cvoid}(a + off), Csize_t(sz))
+        return Ptr{Cvoid}(box)
+    end
+    _whisk_rt_error("getfield: unsupported field kind (inline union field?)")
+    return Ptr{Cvoid}(0)
+end
+
+## `jl_egal__unboxed(a, b, dt)` — egal for unboxed/inline values of the
+## same type: bitwise payload compare over the descriptor's
+## payload_size. Pointer fields compare by identity, matching egal for
+## mutable references. DEBT(#egal-strings): immutable ref fields whose
+## CONTENTS are equal but identities differ (two equal heap Strings)
+## compare unequal here; host egal recurses. Revisit with the data
+## image (interning makes most such literals identical anyway).
+function whisk_jl_egal_unboxed(a::Ptr{Cvoid}, b::Ptr{Cvoid}, dt::Ptr{Cvoid})::Int32
+    d = UInt64(reinterpret(UInt, dt))
+    d == 0 && return Int32(a == b)
+    nptrs = unsafe_load(Ptr{UInt64}(d + UInt64(8)))
+    sz = unsafe_load(Ptr{UInt64}(d + UInt64(24) + (nptrs << 3)))
+    pa = Ptr{UInt8}(a); pb = Ptr{UInt8}(b)
+    i = UInt64(0)
+    while i < sz
+        unsafe_load(pa, Int(i) + 1) == unsafe_load(pb, Int(i) + 1) ||
+            return Int32(0)
+        i += UInt64(1)
+    end
+    return Int32(1)
+end
+
 # Registry: C ABI symbol name → (Julia function, signature).
 # The compile pipeline iterates this, sub-compiles each entry through
 # GPUCompiler, renames the entry symbol, and links into the user's module.
@@ -220,8 +369,18 @@ const COMPILER_RT_HELPERS = (
     ("__ashlti3",       whisk_ashlti3,        Tuple{Ptr{UInt64}, UInt64, UInt64, UInt32}),
     ("ijl_box_int64",   whisk_jl_box_int64,   Tuple{Int64}),
     ("ijl_box_int32",   whisk_jl_box_int32,   Tuple{Int32}),
+    ("ijl_box_int16",   whisk_jl_box_int16,   Tuple{Int16}),
+    ("ijl_box_int8",    whisk_jl_box_int8,    Tuple{Int8}),
     ("ijl_box_uint8",   whisk_jl_box_uint8,   Tuple{UInt8}),
+    ("ijl_box_uint16",  whisk_jl_box_uint16,  Tuple{UInt16}),
+    ("ijl_box_uint32",  whisk_jl_box_uint32,  Tuple{UInt32}),
     ("ijl_box_uint64",  whisk_jl_box_uint64,  Tuple{UInt64}),
     ("ijl_box_float64", whisk_jl_box_float64, Tuple{Float64}),
+    ("ijl_box_float32", whisk_jl_box_float32, Tuple{Float32}),
+    ("ijl_box_char",    whisk_jl_box_char,    Tuple{UInt32}),
+    ("ijl_box_bool",    whisk_jl_box_bool,    Tuple{Int8}),
     ("whisk_ensure_capacity", whisk_ensure_capacity, Tuple{UInt64}),
+    ("ijl_get_nth_field_checked", whisk_jl_get_nth_field_checked, Tuple{Ptr{Cvoid}, UInt64}),
+    ("jl_egal__unboxed",  whisk_jl_egal_unboxed, Tuple{Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}}),
+    ("ijl_egal__unboxed", whisk_jl_egal_unboxed, Tuple{Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}}),
 )

@@ -32,10 +32,16 @@ function emit_layout_addr_table!(mod::LLVM.Module, tags::LayoutTagTable)
     n == 0 && return
     T_w  = LLVM.Int64Type()
 
-    # Materialize each tag's descriptor as a wasm-rodata global.
+    # Materialize each tag's descriptor as a wasm-rodata global. Use
+    # the unified per-type descriptor when the table recorded the
+    # source DataType (always, in practice) so image-uploaded objects
+    # carry real type identity in their headers; fall back to the
+    # shape-keyed layout-only descriptor otherwise.
     desc_globals = LLVM.GlobalVariable[
-        get_or_emit_layout_descriptor!(mod, elsz, copy(offsets))
-        for (elsz, offsets) in tags.keys
+        (tags.types[i] isa DataType ?
+            whisk_type_descriptor!(mod, tags.types[i]) :
+            get_or_emit_layout_descriptor!(mod, tags.keys[i][1], copy(tags.keys[i][2])))
+        for i in 1:n
     ]
 
     fn_ty = LLVM.FunctionType(T_w, [T_w])

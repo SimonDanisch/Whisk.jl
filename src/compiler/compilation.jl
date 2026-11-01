@@ -65,12 +65,39 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
                             # `lower_throw!`, so the runtime calls usually
                             # don't survive.
                             validate = false,
+                            # Whisk owns its runtime: `finish_module!` lowers
+                            # every `julia.gc_alloc_obj` to `whisk_gc_alloc`
+                            # before GPUCompiler's driver would link its GPU
+                            # runtime library, and `link_compiler_rt!` provides
+                            # `ijl_box_*` as plain Julia helpers backed by the
+                            # Whisk GC. Linking GPUCompiler's rtlib anyway
+                            # would bind throw-path box calls to ITS
+                            # `ijl_box_*` (renamed `.N` on collision), which
+                            # allocate via a host-imported `gpu_malloc` and
+                            # tag with host-VM type pointers — wrong allocator
+                            # AND wrong tags for our GC. So: don't link it.
+                            libraries = false,
                             opt_level = optimize ? 2 : 0)
     src    = methodinstance(typeof(f), argtypes)
     job    = CompilerJob(src, config)
 
+    # Closed-world reachability (ARCHITECTURE.md phase 1): the method/
+    # type universe drives dynamic-dispatch resolution. Host-side
+    # analysis only — failures degrade to the trap lowering.
+    world = try
+        reachable_world(f, argtypes)
+    catch err
+        @warn "Whisk: reachability analysis failed; dynamic dispatch falls back to traps" err
+        nothing
+    end
+
     JuliaContext() do _ctx
         mod, meta = GPUCompiler.compile(:llvm, job)
+        # Sub-compile memo entries are keyed by module objectid; a
+        # previous compile that threw mid-pipeline never reached its
+        # end-of-pipeline cleanup. Sweep here — compiles don't nest or
+        # overlap — so failed runs can't pin MethodInstances forever.
+        empty!(SUB_COMPILE_MEMO)
         entry_fn = _resolve_entry_name(mod, meta, name)
 
         # Mark the entry point as exported so wasm-ld keeps it visible.
@@ -117,11 +144,35 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
         # @ijl_invoke calls (deep dispatch chains, e.g. Marshal.decode
         # over a struct of Vectors of structs). Loop to fixpoint so
         # nested invokes get fully resolved before we move on.
-        for _ in 1:8
+        # The fixpoint includes closed-world dispatch resolution:
+        # every stage's sub-compiles can link modules carrying fresh
+        # `julia.call` wrappers, `ijl_invoke`s AND `jl_apply_generic`
+        # sites — iterate until nothing new appears.
+        converged = false
+        fpdbg = haskey(ENV, "WHISK_DEBUG_DISPATCH")
+        for it in 1:64
+            t0 = time()
             lower_julia_call2!(mod)
-            n = lower_invokes!(mod, target, params)
-            n == 0 && break
+            nb = lower_julia_call_builtins!(mod, world, target, params)
+            ni = lower_invokes!(mod, target, params)
+            na = world === nothing ? 0 :
+                 lower_apply_generic!(mod, world, target, params)
+            fpdbg && @info "fixpoint[$it]: builtins=$nb invokes=$ni apply_generic=$na " *
+                "fns=$(count(Returns(true), LLVM.functions(mod))) dt=$(round(time() - t0; digits=1))s"
+            if (nb + ni + na) == 0
+                converged = true
+                break
+            end
         end
+        converged ||
+            @warn "Whisk: lowering fixpoint hit the iteration cap; unresolved calls will trap"
+        # Define the `whisk_typetag_<T>` externs the linked `ijl_box_*`
+        # helpers reference. After the invoke fixpoint (so every
+        # declaration is in), before host-pointer rewriting (which
+        # creates the same `_whisk_type_*` descriptor globals for
+        # baked DataType pointers — both paths must converge on one
+        # global per type).
+        define_box_typetags!(mod)
         # Lower any leftover sub-compiled alloc sites (linked rt helpers,
         # invoked-method bodies) BEFORE host-pointer constants get
         # zeroed — that's the only window where we can decode the
@@ -129,8 +180,14 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
         lower_gc_alloc_wasm!(mod)
         lower_alloc_genericmemory!(mod)
         rewrite_host_pointer_constants!(mod)
+        # Subtype checks against abstract types decide per concrete
+        # universe member; needs descriptor-global RHS operands, hence
+        # after the host-pointer rewrite.
+        world === nothing || lower_subtype_checks!(mod, world)
         scrub_host_globals!(mod)
         lower_dynamic_dispatch!(mod)
+        # Any ijl_invoke whose MI never decoded: loud trap, not import.
+        lower_undecoded_invokes!(mod)
         lower_trap_reports!(mod)
         # Per-tag descriptor address lookup, if the caller provided a
         # LayoutTagTable. Must run before clear_layout_cache! so the
@@ -141,6 +198,7 @@ function compile_to_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple}
             emit_layout_addr_table!(mod, layout_tags)
         end
         Whisk.clear_layout_cache!(mod)
+        delete!(SUB_COMPILE_MEMO, objectid(mod))
 
         LLVM.verify(mod)
 
@@ -376,6 +434,11 @@ function link_wasm(obj_path::String, wasm_path::String; entry_name::String,
     base_args = String[
         "-mwasm64",
         "--no-entry",
+        # Keep all data (notably type descriptors) above 4096: Julia's
+        # tag regime treats values < 4096 as small typetags, so a
+        # descriptor address below that would be misread by any
+        # `tag < 4096` branch. (lld's default global base is 1024.)
+        "--global-base=65536",
         "--export=$entry_name",
         "--export=whisk_gc_alloc",
         "--export=whisk_gc_reserve",
